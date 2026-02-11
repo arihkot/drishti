@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -46,23 +47,99 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
         from backend.services.vectorizer import (
             process_masks_to_plots,
             merge_overlapping_polygons,
+            clip_to_boundary,
         )
+
+        t_start = time.time()
 
         # 1. Fetch satellite imagery
         logger.info(f"Fetching satellite imagery for bbox: {data.bbox}")
         image, meta = await fetch_satellite_image(data.bbox, data.zoom)
-        logger.info(f"Image fetched: {image.shape}")
+        t_fetch = time.time()
+        logger.info(
+            f"[TIMING] Tile fetch: {t_fetch - t_start:.2f}s | Image: {image.shape}"
+        )
 
         # 2. Run SAM detection
         logger.info("Running SAM auto-detection...")
         raw_masks = await detect_boundaries_auto(image, meta)
-        logger.info(f"Raw masks: {len(raw_masks)}")
+        t_sam = time.time()
+        logger.info(
+            f"[TIMING] SAM detection: {t_sam - t_fetch:.2f}s | Raw masks: {len(raw_masks)}"
+        )
 
         # 3. Process masks into plots
         plots_data = process_masks_to_plots(raw_masks, min_area_sqm=data.min_area_sqm)
+        t_process = time.time()
+        logger.info(
+            f"[TIMING] Vectorization: {t_process - t_sam:.2f}s | Plots: {len(plots_data)}"
+        )
 
         # 4. Merge overlapping
         plots_data = merge_overlapping_polygons(plots_data)
+        t_merge = time.time()
+        logger.info(
+            f"[TIMING] Merge: {t_merge - t_process:.2f}s | After merge: {len(plots_data)}"
+        )
+
+        # 4b. Clip to area boundary if area_name provided
+        if data.area_name:
+            try:
+                from backend.models import BasemapCache
+
+                t_clip_start = time.time()
+                category = data.area_category or "industrial"
+                boundary_geom = None
+
+                # Check local DB cache first
+                cached = await db.execute(
+                    select(BasemapCache).where(
+                        BasemapCache.area_name == data.area_name,
+                        BasemapCache.layer_name == category,
+                    )
+                )
+                cached_entry = cached.scalar_one_or_none()
+
+                if cached_entry and cached_entry.geometry:
+                    boundary_geom = cached_entry.geometry
+                    logger.info(f"Using cached boundary for {data.area_name}")
+                else:
+                    # Fall back to CSIDC API and cache the result
+                    from backend.services.csidc_client import csidc_client
+
+                    if category == "industrial":
+                        all_areas = await csidc_client.get_industrial_areas()
+                    elif category == "old_industrial":
+                        all_areas = await csidc_client.get_old_industrial_areas()
+                    elif category == "directorate":
+                        all_areas = await csidc_client.get_directorate_areas()
+                    else:
+                        all_areas = []
+
+                    for area in all_areas:
+                        if area["name"] == data.area_name and area.get("geometry"):
+                            boundary_geom = area["geometry"]
+                            # Cache for future use
+                            cache_entry = BasemapCache(
+                                layer_name=category,
+                                area_name=data.area_name,
+                                geometry_json=json.dumps(boundary_geom),
+                                properties_json=json.dumps(area.get("properties", {})),
+                            )
+                            db.add(cache_entry)
+                            logger.info(
+                                f"Fetched & cached boundary for {data.area_name}"
+                            )
+                            break
+
+                if boundary_geom:
+                    plots_data = clip_to_boundary(plots_data, boundary_geom)
+                    logger.info(
+                        f"[TIMING] Boundary clip: {time.time() - t_clip_start:.2f}s | "
+                        f"Clipped to {data.area_name}: {len(plots_data)} plots"
+                    )
+            except Exception as e:
+                logger.warning(f"Boundary clip failed, keeping all plots: {e}")
 
         # 5. Create or get project
         if data.project_id:
@@ -118,6 +195,12 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
                 }
             )
 
+        t_total = time.time() - t_start
+        logger.info(
+            f"[TIMING] Total pipeline: {t_total:.2f}s | "
+            f"{len(saved_plots)} plots saved to project {project.id}"
+        )
+
         return {
             "project_id": project.id,
             "project_name": project.name,
@@ -129,6 +212,7 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
                 "zoom": meta["zoom"],
                 "tiles": f"{meta['tiles_x']}x{meta['tiles_y']}",
             },
+            "timing_seconds": round(time.time() - t_start, 2),
         }
 
     except HTTPException:

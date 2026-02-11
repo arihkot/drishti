@@ -56,7 +56,7 @@ class Settings(BaseSettings):
 
     # Detection
     MIN_POLYGON_AREA_SQM: float = 10.0
-    SIMPLIFY_TOLERANCE: float = 1.0
+    SIMPLIFY_TOLERANCE: float = 3.0  # ~3.3m in degrees; smooths pixel staircase
     ENCROACHMENT_TOLERANCE_M: float = 2.0
 
     # Map defaults

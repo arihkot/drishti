@@ -29,6 +29,7 @@ dependencies = [
     "opencv-python-headless>=4.10.0",
     "scikit-image>=0.24.0",
     "greenlet>=3.3.1",
+    "scipy>=1.14.0",
 ]
 
 [tool.uv]

@@ -79,6 +79,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   // Layer refs so we can update them without recreating the map
   const baseTileRef = useRef<TileLayer<XYZ> | null>(null);
   const wmsLayerRef = useRef<ImageLayer<ImageWMS> | null>(null);
+  const boundaryLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
   const plotLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
   const deviationLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
 
@@ -89,6 +90,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   const selectedPlotId = useStore((s) => s.selectedPlotId);
   const selectPlot = useStore((s) => s.selectPlot);
   const selectedArea = useStore((s) => s.selectedArea);
+  const setAreaBoundary = useStore((s) => s.setAreaBoundary);
   const comparison = useStore((s) => s.comparison);
   const runPromptDetect = useStore((s) => s.runPromptDetect);
   const loadWMSConfig = useStore((s) => s.loadWMSConfig);
@@ -112,6 +114,19 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
     const plotSource = new VectorSource<Feature<Geometry>>();
     const plotLayer = new VectorLayer({ source: plotSource });
 
+    const boundarySource = new VectorSource<Feature<Geometry>>();
+    const boundaryLayer = new VectorLayer({
+      source: boundarySource,
+      style: new Style({
+        fill: new Fill({ color: "rgba(255, 165, 0, 0.08)" }),
+        stroke: new Stroke({
+          color: "#f97316",
+          width: 3,
+          lineDash: [10, 6],
+        }),
+      }),
+    });
+
     const deviationSource = new VectorSource<Feature<Geometry>>();
     const deviationLayer = new VectorLayer({
       source: deviationSource,
@@ -120,7 +135,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
 
     const map = new Map({
       target: containerRef.current,
-      layers: [baseTile, plotLayer, deviationLayer],
+      layers: [baseTile, boundaryLayer, plotLayer, deviationLayer],
       view: new View({
         center: [82, 20.8],
         zoom: 7,
@@ -129,6 +144,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
     });
 
     baseTileRef.current = baseTile;
+    boundaryLayerRef.current = boundaryLayer;
     plotLayerRef.current = plotLayer;
     deviationLayerRef.current = deviationLayer;
     mapRef.current = map;
@@ -180,7 +196,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       opacity: 0.6,
     });
 
-    // Insert WMS above base tile but below vectors
+    // Insert WMS above base tile but below boundary layer
     map.getLayers().insertAt(1, wmsLayer);
     wmsLayerRef.current = wmsLayer;
   }, [wmsConfig]);
@@ -336,10 +352,21 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   }, [comparison]);
 
   // -------------------------------------------------------------------
-  // 7. Zoom to selected area boundary
+  // 7. Zoom to selected area boundary & render boundary outline
   // -------------------------------------------------------------------
   useEffect(() => {
-    if (!selectedArea || !mapRef.current) return;
+    const boundaryLayer = boundaryLayerRef.current;
+
+    // Clear boundary layer when area changes
+    if (boundaryLayer) {
+      const src = boundaryLayer.getSource();
+      if (src) src.clear();
+    }
+
+    if (!selectedArea || !mapRef.current) {
+      setAreaBoundary(null);
+      return;
+    }
 
     let cancelled = false;
 
@@ -351,6 +378,9 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
         );
         if (cancelled || !mapRef.current) return;
 
+        // Store boundary in Zustand so Sidebar/detection can use it
+        setAreaBoundary(boundary);
+
         const geojsonFormat = new GeoJSON();
         const feature = geojsonFormat.readFeature(
           {
@@ -360,6 +390,15 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
           },
           { dataProjection: "EPSG:4326", featureProjection: "EPSG:4326" }
         ) as Feature<Geometry>;
+
+        // Add boundary feature to the boundary layer
+        if (boundaryLayer) {
+          const src = boundaryLayer.getSource();
+          if (src) {
+            src.clear();
+            src.addFeature(feature);
+          }
+        }
 
         const extent = feature.getGeometry()?.getExtent();
         if (extent) {
@@ -371,13 +410,14 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
         }
       } catch {
         // Boundary fetch failed — no zoom action
+        setAreaBoundary(null);
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [selectedArea]);
+  }, [selectedArea, setAreaBoundary]);
 
   // -------------------------------------------------------------------
   // 8. Click handler — plot selection & prompt-detect

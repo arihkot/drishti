@@ -45,6 +45,7 @@ const AreasPanel: React.FC = () => {
     areas,
     areasLoading,
     selectedArea,
+    areaBoundary,
     loadAreas,
     selectArea,
     detecting,
@@ -177,8 +178,40 @@ const AreasPanel: React.FC = () => {
             disabled={detecting}
             onClick={() => {
               if (!selectedArea) return;
-              const bbox: [number, number, number, number] =
-                mapExtent ?? [0, 0, 0, 0];
+              // Use area boundary bbox if available, fall back to map viewport
+              let bbox: [number, number, number, number];
+              if (areaBoundary?.geometry?.coordinates) {
+                // Deep-flatten coordinates to get all [lon, lat] pairs
+                // Works for Polygon (number[][][]) and MultiPolygon (number[][][][])
+                const flattenCoords = (arr: unknown): number[][] => {
+                  if (
+                    Array.isArray(arr) &&
+                    arr.length >= 2 &&
+                    typeof arr[0] === "number"
+                  ) {
+                    return [arr as number[]];
+                  }
+                  if (Array.isArray(arr)) {
+                    return arr.flatMap((item) => flattenCoords(item));
+                  }
+                  return [];
+                };
+                const allPairs = flattenCoords(areaBoundary.geometry.coordinates);
+                if (allPairs.length > 0) {
+                  const lons = allPairs.map((c) => c[0]);
+                  const lats = allPairs.map((c) => c[1]);
+                  bbox = [
+                    Math.min(...lons),
+                    Math.min(...lats),
+                    Math.max(...lons),
+                    Math.max(...lats),
+                  ];
+                } else {
+                  bbox = mapExtent ?? [0, 0, 0, 0];
+                }
+              } else {
+                bbox = mapExtent ?? [0, 0, 0, 0];
+              }
               const zoom = mapZoom ?? 18;
               runAutoDetect(bbox, zoom);
             }}

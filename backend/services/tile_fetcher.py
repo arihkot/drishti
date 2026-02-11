@@ -1,5 +1,6 @@
 """Satellite tile fetcher - downloads and stitches tiles into GeoTIFFs."""
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -11,6 +12,9 @@ import numpy as np
 from PIL import Image
 
 from backend.config import settings
+
+# Limit concurrent tile downloads to avoid overwhelming the server
+_TILE_CONCURRENCY = 12
 
 logger = logging.getLogger(__name__)
 
@@ -106,15 +110,17 @@ async def fetch_satellite_image(
     grid, rows, cols = tiles_grid(tiles)
     tile_size = 256
 
-    # Fetch all tiles
+    # Fetch all tiles concurrently (with semaphore to limit connections)
+    semaphore = asyncio.Semaphore(_TILE_CONCURRENCY)
+
+    async def _fetch_limited(client: httpx.AsyncClient, tile: mercantile.Tile):
+        async with semaphore:
+            return tile, await fetch_tile(client, tile)
+
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        tile_images = {}
-        for row in grid:
-            for tile in row:
-                if tile:
-                    img = await fetch_tile(client, tile)
-                    if img is not None:
-                        tile_images[tile] = img
+        all_tiles = [t for row in grid for t in row if t]
+        results = await asyncio.gather(*[_fetch_limited(client, t) for t in all_tiles])
+        tile_images = {t: img for t, img in results if img is not None}
 
     # Stitch into single image
     stitched = np.zeros((rows * tile_size, cols * tile_size, 3), dtype=np.uint8)

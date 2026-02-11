@@ -41,19 +41,79 @@ def sqm_to_sqft(sqm: float) -> float:
     return sqm * 10.7639
 
 
+def _chaikin_smooth(coords: list, iterations: int = 2) -> list:
+    """Apply Chaikin corner-cutting algorithm to smooth polygon coordinates.
+
+    Each iteration replaces each segment with two new points at 1/4 and 3/4
+    along the segment, rounding sharp pixel-grid corners into smooth curves.
+    """
+    for _ in range(iterations):
+        if len(coords) < 3:
+            break
+        new_coords = []
+        for i in range(len(coords) - 1):
+            p0 = coords[i]
+            p1 = coords[i + 1]
+            # Q = 3/4 * P0 + 1/4 * P1
+            q = (0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1])
+            # R = 1/4 * P0 + 3/4 * P1
+            r = (0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1])
+            new_coords.append(q)
+            new_coords.append(r)
+        # Close ring
+        new_coords.append(new_coords[0])
+        coords = new_coords
+    return coords
+
+
 def simplify_polygon(polygon: Polygon, tolerance: float = None) -> Polygon:
     """
-    Simplify polygon geometry.
+    Simplify and smooth polygon geometry.
+
+    Pipeline:
+    1. Morphological buffer open (tiny buffer out then in) to remove pixel jaggies
+    2. Chaikin corner-cutting to round angular pixel-grid corners
+    3. Douglas-Peucker simplification to reduce point count
 
     tolerance is in degrees; ~0.00001 degrees ≈ 1.1m at equator
     """
     if tolerance is None:
         tolerance = settings.SIMPLIFY_TOLERANCE * 0.00001  # convert meters to ~degrees
 
-    simplified = polygon.simplify(tolerance, preserve_topology=True)
+    # Step 1: morphological open — smooth pixel staircase edges
+    buf_dist = tolerance * 0.5
+    smoothed = polygon.buffer(buf_dist).buffer(-buf_dist)
+
+    if smoothed.is_empty:
+        smoothed = polygon  # fallback if buffer collapses tiny polygon
+
+    # Handle MultiPolygon from buffer — take the largest
+    if isinstance(smoothed, MultiPolygon):
+        smoothed = max(smoothed.geoms, key=lambda g: g.area)
+
+    if not isinstance(smoothed, Polygon):
+        smoothed = polygon
+
+    # Step 2: Chaikin corner-cutting on the exterior ring
+    exterior_coords = list(smoothed.exterior.coords)
+    smooth_exterior = _chaikin_smooth(exterior_coords, iterations=2)
+
+    # Apply to holes too
+    smooth_holes = []
+    for hole in smoothed.interiors:
+        smooth_holes.append(_chaikin_smooth(list(hole.coords), iterations=2))
+
+    smoothed = Polygon(smooth_exterior, smooth_holes)
+
+    # Step 3: Douglas-Peucker simplification
+    simplified = smoothed.simplify(tolerance, preserve_topology=True)
 
     if not simplified.is_valid:
         simplified = make_valid(simplified)
+
+    # Final safety: ensure it's a Polygon
+    if isinstance(simplified, MultiPolygon):
+        simplified = max(simplified.geoms, key=lambda g: g.area)
 
     return simplified
 
@@ -174,6 +234,76 @@ def process_masks_to_plots(
         f"{counters['infrastructure']} infrastructure"
     )
     return plots
+
+
+def clip_to_boundary(plots: list[dict], boundary_geojson: dict) -> list[dict]:
+    """
+    Clip detected plots to the area boundary.
+
+    Keeps only plots that intersect the boundary polygon. Plots partially
+    outside are clipped to the boundary.
+
+    Args:
+        plots: List of processed plot dicts with 'geometry' keys.
+        boundary_geojson: GeoJSON geometry dict of the area boundary.
+
+    Returns:
+        Filtered & clipped list of plot dicts.
+    """
+    try:
+        boundary = shape(boundary_geojson)
+        if not boundary.is_valid:
+            boundary = make_valid(boundary)
+    except Exception as e:
+        logger.warning(f"Invalid boundary geometry, skipping clip: {e}")
+        return plots
+
+    clipped = []
+    for plot in plots:
+        try:
+            geom = shape(plot["geometry"])
+            if not geom.is_valid:
+                geom = make_valid(geom)
+
+            if not geom.intersects(boundary):
+                continue
+
+            # Clip to boundary
+            intersection = geom.intersection(boundary)
+
+            if intersection.is_empty:
+                continue
+
+            # Handle MultiPolygon — take largest piece
+            if isinstance(intersection, MultiPolygon):
+                intersection = max(intersection.geoms, key=lambda g: g.area)
+
+            if not isinstance(intersection, Polygon):
+                continue
+
+            # Recompute area for the clipped geometry
+            area_sqm = compute_geodetic_area(intersection)
+            if area_sqm < settings.MIN_POLYGON_AREA_SQM:
+                continue
+
+            clipped_plot = plot.copy()
+            clipped_plot["geometry"] = mapping(intersection)
+            clipped_plot["area_sqm"] = round(area_sqm, 2)
+            clipped_plot["area_sqft"] = round(sqm_to_sqft(area_sqm), 2)
+            clipped_plot["perimeter_m"] = round(
+                compute_geodetic_perimeter(intersection), 2
+            )
+            clipped_plot["centroid"] = [
+                intersection.centroid.x,
+                intersection.centroid.y,
+            ]
+            clipped.append(clipped_plot)
+        except Exception as e:
+            logger.warning(f"Failed to clip plot: {e}")
+            continue
+
+    logger.info(f"Clipped {len(plots)} plots to boundary → {len(clipped)} retained")
+    return clipped
 
 
 def merge_overlapping_polygons(

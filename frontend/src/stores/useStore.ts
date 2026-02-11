@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type {
   IndustrialArea,
+  AreaBoundary,
   Project,
   ComparisonResult,
   WMSConfig,
@@ -24,8 +25,10 @@ interface AppState {
   areas: IndustrialArea[];
   areasLoading: boolean;
   selectedArea: IndustrialArea | null;
+  areaBoundary: AreaBoundary | null;
   loadAreas: (category?: string) => Promise<void>;
   selectArea: (area: IndustrialArea | null) => void;
+  setAreaBoundary: (boundary: AreaBoundary | null) => void;
 
   // ---- Project ----
   projects: Project[];
@@ -105,6 +108,7 @@ export const useStore = create<AppState>((set, get) => ({
   areas: [],
   areasLoading: false,
   selectedArea: null,
+  areaBoundary: null,
   loadAreas: async (category) => {
     set({ areasLoading: true });
     try {
@@ -115,7 +119,8 @@ export const useStore = create<AppState>((set, get) => ({
       get().showToast(`Failed to load areas: ${e}`, "error");
     }
   },
-  selectArea: (area) => set({ selectedArea: area }),
+  selectArea: (area) => set({ selectedArea: area, areaBoundary: null }),
+  setAreaBoundary: (boundary) => set({ areaBoundary: boundary }),
 
   // ---- Project ----
   projects: [],

@@ -85,10 +85,12 @@ def get_sam_model():
             automatic=True,
             device=device,
             sam_kwargs={
-                "points_per_side": 32,  # default density, good balance
-                "pred_iou_thresh": 0.80,  # slightly lower to catch more boundaries
-                "stability_score_thresh": 0.85,  # slightly lower for satellite imagery
-                "min_mask_region_area": 100,  # filter tiny noise masks
+                "points_per_side": 48,  # 2304 sample points — good balance of coverage vs speed
+                "pred_iou_thresh": 0.86,  # tighter quality filter — rejects low-quality masks early (speeds up)
+                "stability_score_thresh": 0.92,  # more stable masks — reduces noise (speeds up)
+                "min_mask_region_area": 25,  # catch smaller features (buildings, sheds)
+                # crop_n_layers removed — was ~5x compute multiplier for marginal accuracy gain;
+                # the vectorization pipeline (Chaikin + morphological smoothing) compensates
             },
         )
         logger.info("SAM2 model loaded successfully")
@@ -279,8 +281,25 @@ def _extract_masks_from_output(mask_path: str, meta: dict) -> list[dict]:
             unique_values = np.unique(mask_data)
             unique_values = unique_values[unique_values > 0]  # skip background
 
+            # Batch morphological smoothing: process the full labeled mask once
+            # instead of running binary_closing/opening per unique value.
+            from scipy.ndimage import binary_closing, binary_opening
+
+            # Create a single binary foreground mask and smooth it once
+            fg_mask = (mask_data > 0).astype(np.uint8)
+            fg_smooth = binary_closing(fg_mask, iterations=2).astype(np.uint8)
+            fg_smooth = binary_opening(fg_smooth, iterations=1).astype(np.uint8)
+
+            # Apply smoothed foreground: zero out pixels removed by opening,
+            # keep original labels where foreground survived
+            smoothed_labels = mask_data * fg_smooth
+
             for val in unique_values:
-                binary_mask = (mask_data == val).astype(np.uint8)
+                binary_mask = (smoothed_labels == val).astype(np.uint8)
+
+                # Skip if morphological ops removed this mask entirely
+                if not binary_mask.any():
+                    continue
 
                 # Extract polygon from mask
                 for geom, value in shapes(binary_mask, transform=transform):
