@@ -1,0 +1,35 @@
+[project]
+name = "drishti"
+version = "0.1.0"
+description = "Automated Monitoring and Compliance of Industrial Land Allotments"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "sqlalchemy>=2.0.0",
+    "aiosqlite>=0.21.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "python-multipart>=0.0.20",
+    "rasterio>=1.4.0",
+    "geopandas>=1.0.0",
+    "shapely>=2.0.0",
+    "pyproj>=3.7.0",
+    "numpy>=2.0.0",
+    "pillow>=11.0.0",
+    "matplotlib>=3.10.0",
+    "reportlab>=4.2.0",
+    "segment-geospatial>=0.16.0",
+    "torch>=2.5.0",
+    "torchvision>=0.20.0",
+    "leafmap>=0.42.0",
+    "mercantile>=1.2.0",
+    "opencv-python-headless>=4.10.0",
+    "scikit-image>=0.24.0",
+    "greenlet>=3.3.1",
+]
+
+[tool.uv]
+dev-dependencies = []

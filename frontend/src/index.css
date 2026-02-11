@@ -1,0 +1,50 @@
+@import "tailwindcss";
+@import "ol/ol.css";
+
+:root {
+  --csidc-orange: #e65100;
+  --csidc-green: #1b5e20;
+  --csidc-blue: #0d47a1;
+  --csidc-gold: #f9a825;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  overflow: hidden;
+}
+
+/* OpenLayers overrides */
+.ol-control button {
+  background-color: rgba(0, 0, 0, 0.6) !important;
+  color: white !important;
+  font-size: 1.1rem !important;
+}
+
+.ol-control button:hover {
+  background-color: rgba(0, 0, 0, 0.8) !important;
+}
+
+.ol-attribution {
+  font-size: 10px;
+}
+
+/* Custom scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #888;
+  border-radius: 3px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
