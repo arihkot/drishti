@@ -1,17 +1,26 @@
-import { Eye, Satellite, PanelLeft, MapPinned, Loader2 } from "lucide-react";
+import { Eye, EyeOff, Satellite, PanelLeft, MapPinned, LayoutDashboard, LogOut } from "lucide-react";
 import { useStore } from "../stores/useStore";
 
-export default function Header() {
+interface HeaderProps {
+  onDashboard?: () => void;
+  onLogout?: () => void;
+}
+
+export default function Header({ onDashboard, onLogout }: HeaderProps) {
   const viewMode = useStore((s) => s.viewMode);
   const setViewMode = useStore((s) => s.setViewMode);
   const toggleSidebar = useStore((s) => s.toggleSidebar);
   const showCsidcReference = useStore((s) => s.showCsidcReference);
   const toggleCsidcReference = useStore((s) => s.toggleCsidcReference);
-  const csidcReferenceLoading = useStore((s) => s.csidcReferenceLoading);
-  const selectedArea = useStore((s) => s.selectedArea);
+  const hideDetectedPlots = useStore((s) => s.hideDetectedPlots);
+  const toggleHideDetectedPlots = useStore((s) => s.toggleHideDetectedPlots);
+  const activeProject = useStore((s) => s.activeProject);
+  const showToast = useStore((s) => s.showToast);
+
+  const hasBbox = activeProject?.bbox && activeProject.bbox.length === 4;
 
   return (
-    <header className="fixed top-0 left-0 right-0 z-50 h-14 bg-gradient-to-r from-orange-800 to-orange-600 flex items-center justify-between px-4 shadow-md">
+    <header className="fixed top-0 left-0 right-0 z-50 h-14 bg-blue-800 flex items-center justify-between px-4 shadow-md">
       {/* Left: Branding */}
       <div className="flex items-center gap-2 min-w-0">
         <div className="flex flex-col leading-tight">
@@ -31,13 +40,25 @@ export default function Header() {
 
       {/* Right: Controls */}
       <div className="flex items-center gap-2">
+        {/* Dashboard button */}
+        {onDashboard && (
+          <button
+            onClick={onDashboard}
+            className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md border border-white/30 text-white/70 hover:bg-white/10 transition-colors"
+            title="Return to Dashboard"
+          >
+            <LayoutDashboard size={14} />
+            Dashboard
+          </button>
+        )}
+
         {/* View mode toggle */}
         <div className="flex rounded-md overflow-hidden border border-white/30">
           <button
             onClick={() => setViewMode("satellite")}
             className={`flex items-center gap-1 px-2.5 py-1 text-xs font-medium transition-colors ${
               viewMode === "satellite"
-                ? "bg-white text-orange-800"
+                ? "bg-white text-blue-900"
                 : "text-white hover:bg-white/10"
             }`}
           >
@@ -48,7 +69,7 @@ export default function Header() {
             onClick={() => setViewMode("schematic")}
             className={`flex items-center gap-1 px-2.5 py-1 text-xs font-medium transition-colors ${
               viewMode === "schematic"
-                ? "bg-white text-orange-800"
+                ? "bg-white text-blue-900"
                 : "text-white hover:bg-white/10"
             }`}
           >
@@ -60,33 +81,57 @@ export default function Header() {
         {/* CSIDC reference layer toggle */}
         <button
           onClick={() => {
-            if (!selectedArea) return;
+            if (!hasBbox) {
+              showToast("Run detection first to see CSIDC reference overlay", "info");
+              return;
+            }
             toggleCsidcReference();
           }}
-          disabled={csidcReferenceLoading}
           className={`flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md border transition-colors ${
-            !selectedArea
+            !hasBbox
               ? "text-white/30 border-white/15 cursor-not-allowed"
-              : csidcReferenceLoading
-                ? "text-white/50 border-white/30 cursor-wait"
-                : showCsidcReference
-                  ? "bg-white text-orange-800 border-white"
-                  : "text-white/70 border-white/30 hover:bg-white/10"
+              : showCsidcReference
+                ? "bg-white text-blue-900 border-white"
+                : "text-white/70 border-white/30 hover:bg-white/10"
           }`}
           title={
-            !selectedArea
-              ? "Select an area first"
-              : csidcReferenceLoading
-                ? "Loading CSIDC reference plots..."
-                : "Toggle CSIDC reference plots overlay"
+            !hasBbox
+              ? "Run detection first to enable CSIDC reference overlay"
+              : showCsidcReference
+                ? "Hide CSIDC reference plots"
+                : "Show CSIDC reference plots overlay"
           }
         >
-          {csidcReferenceLoading ? (
-            <Loader2 size={14} className="animate-spin" />
-          ) : (
-            <MapPinned size={14} />
-          )}
+          <MapPinned size={14} />
           CSIDC Ref
+        </button>
+
+        {/* CSIDC Only mode toggle — hides detected plots */}
+        <button
+          onClick={() => {
+            if (!hasBbox) {
+              showToast("Run detection first to use CSIDC Only mode", "info");
+              return;
+            }
+            toggleHideDetectedPlots();
+          }}
+          className={`flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md border transition-colors ${
+            !hasBbox
+              ? "text-white/30 border-white/15 cursor-not-allowed"
+              : hideDetectedPlots
+                ? "bg-white text-blue-900 border-white"
+                : "text-white/70 border-white/30 hover:bg-white/10"
+          }`}
+          title={
+            !hasBbox
+              ? "Run detection first to enable CSIDC Only mode"
+              : hideDetectedPlots
+                ? "Show detected plot boundaries"
+                : "Hide detected plots, show only CSIDC reference"
+          }
+        >
+          <EyeOff size={14} />
+          CSIDC Only
         </button>
 
         {/* Sidebar toggle */}
@@ -97,6 +142,17 @@ export default function Header() {
         >
           <PanelLeft size={20} />
         </button>
+
+        {/* Logout */}
+        {onLogout && (
+          <button
+            onClick={onLogout}
+            className="p-1.5 rounded-md text-white/70 hover:bg-white/10 hover:text-white transition-colors"
+            title="Sign out"
+          >
+            <LogOut size={16} />
+          </button>
+        )}
       </div>
     </header>
   );

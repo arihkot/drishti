@@ -10,6 +10,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
 )
@@ -187,3 +188,15 @@ class CsidcReferencePlot(Base):
         if self.properties_json:
             return json.loads(self.properties_json)
         return {}
+
+
+class WmsTileCache(Base):
+    """Cached WMS tile images from CSIDC GeoServer."""
+
+    __tablename__ = "wms_tile_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cache_key = Column(String(64), nullable=False, unique=True, index=True)
+    content_type = Column(String(64), nullable=False, default="image/png")
+    tile_data = Column(LargeBinary, nullable=False)
+    fetched_at = Column(DateTime, default=utcnow)

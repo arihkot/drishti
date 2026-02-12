@@ -15,6 +15,23 @@ from backend.models import Plot, Project
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# Valid categories in the current system. Old categories from previous
+# detection runs (building, infrastructure, open_land, other) are remapped
+# to "plot" when served to the frontend.
+VALID_CATEGORIES = {"plot", "road", "boundary"}
+CATEGORY_COLORS = {"plot": "#ef4444", "road": "#64748b", "boundary": "#f97316"}
+
+
+def _remap_category(category: str) -> str:
+    """Remap old/invalid categories to 'plot'."""
+    return category if category in VALID_CATEGORIES else "plot"
+
+
+def _remap_color(category: str, color: str) -> str:
+    """Ensure color matches remapped category."""
+    cat = _remap_category(category)
+    return CATEGORY_COLORS.get(cat, color)
+
 
 class ProjectCreate(BaseModel):
     name: str
@@ -36,6 +53,7 @@ class PlotUpdate(BaseModel):
     label: str | None = None
     category: str | None = None
     color: str | None = None
+    geometry: dict | None = None  # GeoJSON geometry dict
 
 
 @router.get("")
@@ -110,12 +128,12 @@ async def get_project(project_id: int, db: AsyncSession = Depends(get_db)):
             {
                 "id": p.id,
                 "label": p.label,
-                "category": p.category,
+                "category": _remap_category(p.category),
                 "geometry": p.geometry,
                 "area_sqm": p.area_sqm,
                 "area_sqft": p.area_sqft,
                 "perimeter_m": p.perimeter_m,
-                "color": p.color,
+                "color": _remap_color(p.category, p.color),
                 "confidence": p.confidence,
                 "is_active": p.is_active,
                 "properties": p.properties,
@@ -164,7 +182,7 @@ async def update_plot(
     data: PlotUpdate,
     db: AsyncSession = Depends(get_db),
 ):
-    """Update a plot (rename, change category/color)."""
+    """Update a plot (rename, change category/color, or update geometry)."""
     result = await db.execute(
         select(Plot).where(Plot.id == plot_id, Plot.project_id == project_id)
     )
@@ -179,12 +197,54 @@ async def update_plot(
     if data.color is not None:
         plot.color = data.color
 
-    return {
+    # Geometry update — recalculate area, perimeter, centroid
+    if data.geometry is not None:
+        from shapely.geometry import shape, mapping
+        from shapely.validation import make_valid
+
+        try:
+            geom = shape(data.geometry)
+            if not geom.is_valid:
+                geom = make_valid(geom)
+
+            # Recalculate geodetic measurements
+            from backend.services.vectorizer import (
+                compute_geodetic_area,
+                compute_geodetic_perimeter,
+                sqm_to_sqft,
+            )
+
+            area_sqm = compute_geodetic_area(geom)
+            area_sqft = sqm_to_sqft(area_sqm)
+            perimeter_m = compute_geodetic_perimeter(geom)
+
+            plot.geometry_json = json.dumps(mapping(geom))
+            plot.area_sqm = round(area_sqm, 2)
+            plot.area_sqft = round(area_sqft, 2)
+            plot.perimeter_m = round(perimeter_m, 2)
+
+            logger.info(
+                f"Plot {plot_id} geometry updated: "
+                f"{area_sqm:.1f} sqm, {perimeter_m:.1f}m perimeter"
+            )
+        except Exception as e:
+            logger.error(f"Invalid geometry for plot {plot_id}: {e}")
+            raise HTTPException(status_code=422, detail=f"Invalid geometry: {str(e)}")
+
+    response = {
         "id": plot.id,
         "label": plot.label,
         "category": plot.category,
         "color": plot.color,
+        "area_sqm": plot.area_sqm,
+        "area_sqft": plot.area_sqft,
+        "perimeter_m": plot.perimeter_m,
     }
+
+    if data.geometry is not None:
+        response["geometry"] = plot.geometry
+
+    return response
 
 
 @router.delete("/{project_id}/plots/{plot_id}")

@@ -129,12 +129,13 @@ def _shape_aspect(polygon: Polygon) -> float:
 
 
 def classify_polygon(polygon: Polygon, area_sqm: float) -> str:
-    """Shape-only fallback classifier (used when no satellite image available)."""
+    """Shape-only fallback classifier (used when no satellite image available).
+
+    Only returns 'road' or 'plot' — all non-road features are plots.
+    """
     aspect = _shape_aspect(polygon)
-    if aspect > 6.0 and area_sqm > 50:
+    if aspect > 5.0 and area_sqm > 50:
         return "road"
-    if area_sqm < settings.MIN_POLYGON_AREA_SQM:
-        return "infrastructure"
     return "plot"
 
 
@@ -144,11 +145,11 @@ def classify_by_color_and_shape(
     image: np.ndarray,
     meta: dict,
 ) -> str:
-    """Classify a detected polygon using satellite pixel colors + shape.
+    """Classify a detected polygon as either 'road' or 'plot'.
 
-    Analyses the mean RGB values within the polygon's bounding box from the
-    satellite image and combines with geometric properties to assign one of:
-        plot, road, vegetation, open_land, water, building
+    Uses satellite pixel colors and geometric shape to distinguish roads
+    from plots. Everything that is not a road is classified as a plot.
+    This keeps the output restricted to 3 categories: plot, road, boundary.
 
     Args:
         polygon: Shapely Polygon in EPSG:4326.
@@ -157,16 +158,14 @@ def classify_by_color_and_shape(
         meta: Tile metadata with bbox and pixel_size fields.
 
     Returns:
-        Category string.
+        'road' or 'plot'.
     """
     from backend.services.tile_fetcher import lonlat_to_pixel
 
     aspect = _shape_aspect(polygon)
 
     # --- extract pixel crop for this polygon ---
-    bounds = (
-        polygon.bounds
-    )  # (minx, miny, maxx, maxy) = (minLon, minLat, maxLon, maxLat)
+    bounds = polygon.bounds  # (minLon, minLat, maxLon, maxLat)
     min_px, min_py = lonlat_to_pixel(bounds[0], bounds[3], meta)  # top-left
     max_px, max_py = lonlat_to_pixel(bounds[2], bounds[1], meta)  # bottom-right
 
@@ -189,85 +188,46 @@ def classify_by_color_and_shape(
     mean_b = float(crop[:, :, 2].mean())
 
     total = mean_r + mean_g + mean_b + 1e-6
-    g_ratio = mean_g / total
-    b_ratio = mean_b / total
-    r_ratio = mean_r / total
-
-    # Green index  (G - R) / (G + R)  — positive = green-dominant
-    green_idx = (mean_g - mean_r) / (mean_g + mean_r + 1e-6)
-
     brightness = total / 3.0
 
     max_c = max(mean_r, mean_g, mean_b)
     min_c = min(mean_r, mean_g, mean_b)
     saturation = (max_c - min_c) / (max_c + 1e-6)  # 0..1
 
-    # --- classification rules (order matters) ---
+    # --- road detection rules ---
 
     # 1. Very elongated → road regardless of color
-    if aspect > 6.0 and area_sqm > 50:
+    if aspect > 5.0 and area_sqm > 50:
         return "road"
 
-    # 2. Water — blue-dominant
-    if b_ratio > 0.38 and mean_b > mean_g and mean_b > mean_r:
-        return "water"
-
-    # 3. Vegetation — green-dominant
-    if green_idx > 0.04 and g_ratio > 0.36:
-        return "vegetation"
-
-    # 4. Road (non-elongated pavement / parking) — gray, low saturation
-    if saturation < 0.15 and 80 < brightness < 180 and aspect > 3.0:
+    # 2. Road-like pavement — gray, low saturation, somewhat elongated
+    if saturation < 0.25 and 60 < brightness < 190 and aspect > 2.5:
         return "road"
 
-    # 5. Open / vacant land — warm earthy tones, low-moderate sat
-    if r_ratio > 0.36 and g_ratio > 0.30 and saturation < 0.25 and brightness < 170:
-        return "open_land"
-
-    # 6. Small structures → building
-    if area_sqm < 200 and saturation < 0.3:
-        return "building"
-
-    # 7. Bright concrete rooftops → building
-    if brightness > 190 and saturation < 0.18 and area_sqm < 2000:
-        return "building"
-
-    # 8. Tiny features
-    if area_sqm < settings.MIN_POLYGON_AREA_SQM:
-        return "infrastructure"
-
-    # Default: built-up industrial / commercial plot
+    # Everything else is a plot (industrial/commercial land, buildings,
+    # open land, vegetation — all treated as "plot" for CSIDC purposes)
     return "plot"
 
 
 # ---- category → display colour mapping ----
+# Restricted to 3 categories: plot, road, boundary
 CATEGORY_COLORS: dict[str, str] = {
     "plot": "#ef4444",  # Red — industrial/commercial plots
     "road": "#64748b",  # Slate — roads & pavement
-    "vegetation": "#22c55e",  # Green — parks, trees, green belt
-    "open_land": "#d97706",  # Amber — vacant / bare land
-    "water": "#3b82f6",  # Blue — water bodies
-    "building": "#a855f7",  # Purple — individual structures
-    "infrastructure": "#f59e0b",  # Yellow — utility infra
-    "other": "#6b7280",  # Gray — unclassified
+    "boundary": "#f97316",  # Orange — area boundary
 }
 
 # Human-readable labels for each category
 CATEGORY_LABELS: dict[str, str] = {
     "plot": "Plot",
     "road": "Road",
-    "vegetation": "Vegetation",
-    "open_land": "Open Land",
-    "water": "Water",
-    "building": "Building",
-    "infrastructure": "Infrastructure",
-    "other": "Other",
+    "boundary": "Boundary",
 }
 
 
 def get_color_for_category(category: str) -> str:
     """Get default display color for a category."""
-    return CATEGORY_COLORS.get(category, CATEGORY_COLORS["other"])
+    return CATEGORY_COLORS.get(category, CATEGORY_COLORS["plot"])
 
 
 def process_masks_to_plots(
@@ -359,6 +319,22 @@ def process_masks_to_plots(
     return plots
 
 
+def renumber_labels(plots: list[dict]) -> list[dict]:
+    """Re-number plot labels sequentially per category.
+
+    After merge/clip steps remove some plots the original numbering has gaps
+    (e.g. Plot 1, Plot 4, Plot 23).  This assigns clean sequential numbers
+    (Plot 1, Plot 2, Plot 3…) while preserving category order.
+    """
+    counters: dict[str, int] = {}
+    for plot in plots:
+        cat = plot.get("category", "plot")
+        counters[cat] = counters.get(cat, 0) + 1
+        cat_label = CATEGORY_LABELS.get(cat, cat.capitalize())
+        plot["label"] = f"{cat_label} {counters[cat]}"
+    return plots
+
+
 def clip_to_boundary(plots: list[dict], boundary_geojson: dict) -> list[dict]:
     """
     Clip detected plots to the area boundary.
@@ -430,9 +406,13 @@ def clip_to_boundary(plots: list[dict], boundary_geojson: dict) -> list[dict]:
 
 
 def merge_overlapping_polygons(
-    polygons: list[dict], overlap_threshold: float = 0.5
+    polygons: list[dict], overlap_threshold: float = 0.30
 ) -> list[dict]:
-    """Merge polygons that overlap significantly."""
+    """Merge polygons that overlap significantly.
+
+    Uses 30% overlap threshold (lowered from 50%) to catch more cases
+    where SAM creates overlapping detections for the same plot.
+    """
     if not polygons:
         return polygons
 
@@ -468,3 +448,324 @@ def merge_overlapping_polygons(
         merged.append(plot)
 
     return merged
+
+
+def remove_contained_polygons(
+    polygons: list[dict], containment_threshold: float = 0.35
+) -> list[dict]:
+    """Remove smaller polygons that are mostly contained inside larger ones.
+
+    After merge and simplification, SAM may still produce nested detections
+    where a smaller feature sits inside a larger one without exceeding the
+    merge overlap threshold.  This pass removes the smaller polygon when
+    >= containment_threshold of its area falls inside a larger polygon.
+
+    Also removes polygons where the larger polygon covers a significant portion
+    of the smaller one's bounding box, indicating the smaller is a sub-detection.
+
+    Polygons are compared largest-first so that a small polygon contained
+    by *any* larger one is dropped.
+
+    Uses 35% threshold (lowered from 40%) to be more aggressive about
+    removing nested detections that SAM creates inside larger plots.
+    """
+    if len(polygons) < 2:
+        return polygons
+
+    # Build (geom, idx) pairs sorted by area descending
+    items = []
+    for idx, p in enumerate(polygons):
+        try:
+            geom = shape(p["geometry"])
+            if not geom.is_valid:
+                geom = make_valid(geom)
+            items.append((geom, idx))
+        except Exception:
+            items.append((None, idx))
+
+    # Sort by area descending (largest first)
+    items.sort(key=lambda x: x[0].area if x[0] else 0, reverse=True)
+
+    drop = set()
+    for pos_j in range(len(items)):
+        geom_j, idx_j = items[pos_j]
+        if geom_j is None or idx_j in drop:
+            continue
+
+        # Check against all larger polygons (earlier in sorted list)
+        for pos_i in range(pos_j):
+            geom_i, idx_i = items[pos_i]
+            if geom_i is None or idx_i in drop:
+                continue
+
+            try:
+                if not geom_i.intersects(geom_j):
+                    continue
+
+                intersection = geom_i.intersection(geom_j)
+                # What fraction of the smaller polygon is inside the larger?
+                ratio = intersection.area / (geom_j.area + 1e-12)
+
+                if ratio >= containment_threshold:
+                    drop.add(idx_j)
+                    break  # Already dropping this one, no need to check more
+
+                # Also check if the smaller polygon's centroid is inside the larger
+                # This catches cases where overlap area is low but the small plot
+                # is clearly inside the larger one
+                if geom_i.contains(geom_j.centroid) and ratio >= 0.20:
+                    drop.add(idx_j)
+                    break
+            except Exception:
+                continue
+
+    kept = [p for idx, p in enumerate(polygons) if idx not in drop]
+    if drop:
+        logger.info(
+            f"Containment filter: removed {len(drop)} nested polygons, "
+            f"{len(kept)} retained"
+        )
+    return kept
+
+
+def merge_small_nearby_polygons(
+    polygons: list[dict],
+    proximity_degrees: float = 0.0003,  # ~30m at equator
+    small_area_threshold_sqm: float = 2000.0,
+) -> list[dict]:
+    """Merge small nearby/overlapping polygons that should be one plot.
+
+    SAM often fragments a single plot into multiple small detections.
+    This function finds clusters of small polygons that are near each other
+    (within proximity_degrees) and merges them into single polygons.
+
+    Args:
+        polygons: List of plot dicts with 'geometry' keys.
+        proximity_degrees: Max gap between polygons to consider them neighbors.
+        small_area_threshold_sqm: Polygons smaller than this are candidates for merging.
+
+    Returns:
+        List of plot dicts with small clusters merged.
+    """
+    if len(polygons) < 2:
+        return polygons
+
+    # Separate large plots (keep as-is) from small candidates
+    large_plots = []
+    small_items: list[tuple[Polygon, int]] = []
+
+    for idx, p in enumerate(polygons):
+        try:
+            geom = shape(p["geometry"])
+            if not geom.is_valid:
+                geom = make_valid(geom)
+            area_sqm = p.get("area_sqm", compute_geodetic_area(geom))
+            if area_sqm >= small_area_threshold_sqm:
+                large_plots.append(p)
+            else:
+                small_items.append((geom, idx))
+        except Exception:
+            large_plots.append(p)
+
+    if len(small_items) < 2:
+        return polygons  # nothing to merge
+
+    # Build adjacency clusters: two small polygons are "neighbors" if
+    # buffering one by proximity_degrees makes it intersect the other
+    parent = list(range(len(small_items)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(len(small_items)):
+        geom_i = small_items[i][0]
+        buffered_i = geom_i.buffer(proximity_degrees)
+        for j in range(i + 1, len(small_items)):
+            geom_j = small_items[j][0]
+            try:
+                if buffered_i.intersects(geom_j):
+                    union(i, j)
+            except Exception:
+                continue
+
+    # Group clusters
+    clusters: dict[int, list[int]] = {}
+    for i in range(len(small_items)):
+        root = find(i)
+        clusters.setdefault(root, []).append(i)
+
+    merged_plots = list(large_plots)
+    singles_kept = 0
+    clusters_merged = 0
+
+    for members in clusters.values():
+        if len(members) == 1:
+            # Single small polygon — keep as-is
+            idx = small_items[members[0]][1]
+            merged_plots.append(polygons[idx])
+            singles_kept += 1
+        else:
+            # Merge cluster into one polygon
+            geoms = [small_items[m][0] for m in members]
+            merged_geom = unary_union(geoms)
+
+            if isinstance(merged_geom, MultiPolygon):
+                merged_geom = max(merged_geom.geoms, key=lambda g: g.area)
+
+            if not isinstance(merged_geom, Polygon):
+                # Fallback: keep the largest member
+                largest_idx = max(members, key=lambda m: small_items[m][0].area)
+                merged_plots.append(polygons[small_items[largest_idx][1]])
+                continue
+
+            # Use the first member's metadata as base
+            base_idx = small_items[members[0]][1]
+            base_plot = polygons[base_idx].copy()
+
+            area_sqm = compute_geodetic_area(merged_geom)
+            base_plot["geometry"] = mapping(merged_geom)
+            base_plot["area_sqm"] = round(area_sqm, 2)
+            base_plot["area_sqft"] = round(sqm_to_sqft(area_sqm), 2)
+            base_plot["perimeter_m"] = round(compute_geodetic_perimeter(merged_geom), 2)
+            base_plot["centroid"] = [merged_geom.centroid.x, merged_geom.centroid.y]
+            merged_plots.append(base_plot)
+            clusters_merged += 1
+
+    if clusters_merged > 0:
+        logger.info(
+            f"Small-nearby merge: {len(small_items)} small polygons → "
+            f"{singles_kept} kept + {clusters_merged} merged clusters"
+        )
+    return merged_plots
+
+
+def inject_missing_csidc_plots(
+    detected_plots: list[dict],
+    csidc_plots: list[dict],
+    coverage_threshold: float = 0.25,
+    image: np.ndarray | None = None,
+    meta: dict | None = None,
+) -> list[dict]:
+    """Inject CSIDC reference plots that were completely missed by SAM detection.
+
+    After SAM auto-detection + guided detection + vectorization, some CSIDC
+    reference plots may still not be detected. This function checks each
+    CSIDC reference plot against the already-detected plots. If a reference
+    plot has less than coverage_threshold overlap with any detected plot,
+    its geometry is injected directly as a detected plot.
+
+    This ensures that known plots from the CSIDC reference map are always
+    represented in the output, even if SAM couldn't segment them.
+
+    Args:
+        detected_plots: Already-detected and processed plot dicts.
+        csidc_plots: CSIDC reference plot dicts with 'geometry' and 'name'.
+        coverage_threshold: Min coverage ratio to consider a ref plot "found".
+        image: Optional satellite image for color classification.
+        meta: Optional tile metadata.
+
+    Returns:
+        Extended list of plot dicts with missing CSIDC plots injected.
+    """
+    if not csidc_plots:
+        return detected_plots
+
+    # Build union of all detected geometries
+    detected_geoms = []
+    for p in detected_plots:
+        try:
+            g = shape(p["geometry"])
+            if not g.is_valid:
+                g = make_valid(g)
+            detected_geoms.append(g)
+        except Exception:
+            continue
+
+    if detected_geoms:
+        detected_union = unary_union(detected_geoms)
+    else:
+        detected_union = Polygon()  # empty
+
+    injected = []
+    use_color = image is not None and meta is not None
+
+    for csidc_plot in csidc_plots:
+        try:
+            geom = csidc_plot.get("geometry")
+            if not geom or not geom.get("coordinates"):
+                continue
+
+            ref_poly = shape(geom)
+            if not ref_poly.is_valid:
+                ref_poly = make_valid(ref_poly)
+
+            if ref_poly.is_empty or ref_poly.area < 1e-10:
+                continue
+
+            if isinstance(ref_poly, MultiPolygon):
+                ref_poly = max(ref_poly.geoms, key=lambda g: g.area)
+
+            if not isinstance(ref_poly, Polygon):
+                continue
+
+            # Check coverage: how much of this CSIDC plot is already detected?
+            try:
+                intersection = ref_poly.intersection(detected_union)
+                coverage = intersection.area / ref_poly.area if ref_poly.area > 0 else 0
+            except Exception:
+                coverage = 0.0
+
+            if coverage >= coverage_threshold:
+                continue  # Already detected
+
+            # This plot was missed — inject its geometry
+            simplified = simplify_polygon(ref_poly)
+            area_sqm = compute_geodetic_area(simplified)
+
+            if area_sqm < settings.MIN_POLYGON_AREA_SQM:
+                continue
+
+            # Classify
+            if use_color:
+                category = classify_by_color_and_shape(
+                    simplified, area_sqm, image, meta
+                )
+            else:
+                category = classify_polygon(simplified, area_sqm)
+
+            plot_name = csidc_plot.get("name", "")
+            label = f"{CATEGORY_LABELS.get(category, category.capitalize())} (Ref: {plot_name})"
+
+            plot = {
+                "label": label,
+                "category": category,
+                "geometry": mapping(simplified),
+                "area_sqm": round(area_sqm, 2),
+                "area_sqft": round(sqm_to_sqft(area_sqm), 2),
+                "perimeter_m": round(compute_geodetic_perimeter(simplified), 2),
+                "color": get_color_for_category(category),
+                "confidence": 0.7,  # lower confidence since not SAM-detected
+                "centroid": [simplified.centroid.x, simplified.centroid.y],
+                "source": "csidc_reference",
+            }
+            injected.append(plot)
+
+        except Exception as e:
+            logger.warning(f"Error injecting CSIDC plot: {e}")
+            continue
+
+    if injected:
+        logger.info(
+            f"CSIDC injection: {len(injected)} missed ref plots injected "
+            f"(out of {len(csidc_plots)} total ref plots)"
+        )
+
+    return detected_plots + injected

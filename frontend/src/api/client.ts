@@ -52,21 +52,10 @@ export async function fetchAreaBoundary(
 }
 
 export async function fetchDistricts(): Promise<{
-  districts: { name: string; code: string; geometry: GeoJSONGeometry }[];
+  districts: { name: string; code: string; geometry: unknown }[];
   total: number;
 }> {
   return request("/api/areas/districts");
-}
-
-export async function fetchReferencePlots(
-  areaName: string
-): Promise<{
-  area_name: string;
-  plots: { name: string; geometry: GeoJSONGeometry; properties: Record<string, unknown> }[];
-  total: number;
-  source: string;
-}> {
-  return request(`/api/areas/${encodeURIComponent(areaName)}/reference-plots`);
 }
 
 // ---- Projects ----
@@ -101,8 +90,8 @@ export async function deleteProject(id: number): Promise<void> {
 export async function updatePlot(
   projectId: number,
   plotId: number,
-  data: { label?: string; category?: string; color?: string }
-): Promise<{ id: number; label: string; category: string; color: string }> {
+  data: { label?: string; category?: string; color?: string; geometry?: GeoJSONGeometry }
+): Promise<{ id: number; label: string; category: string; color: string; area_sqm?: number; area_sqft?: number; perimeter_m?: number }> {
   return request(`/api/projects/${projectId}/plots/${plotId}`, {
     method: "PUT",
     body: JSON.stringify(data),

@@ -5,7 +5,7 @@ import type {
   Project,
   ComparisonResult,
   WMSConfig,
-  CsidcReferencePlot,
+  GeoJSONGeometry,
 } from "../types";
 import * as api from "../api/client";
 
@@ -23,9 +23,8 @@ interface AppState {
   setMapView: (extent: [number, number, number, number], zoom: number) => void;
   showCsidcReference: boolean;
   toggleCsidcReference: () => void;
-  csidcReferencePlots: CsidcReferencePlot[];
-  csidcReferenceLoading: boolean;
-  loadCsidcReferencePlots: (areaName: string) => Promise<void>;
+  hideDetectedPlots: boolean;
+  toggleHideDetectedPlots: () => void;
 
   // ---- Areas ----
   areas: IndustrialArea[];
@@ -56,6 +55,14 @@ interface AppState {
     color: string
   ) => Promise<void>;
   removePlot: (plotId: number) => Promise<void>;
+
+  // ---- Boundary Editing ----
+  editingPlotId: number | null;
+  editingGeometry: GeoJSONGeometry | null;
+  startEditing: (plotId: number) => void;
+  cancelEditing: () => void;
+  saveEditing: () => Promise<void>;
+  updateEditingGeometry: (geom: GeoJSONGeometry) => void;
 
   // ---- Detection ----
   detecting: boolean;
@@ -103,33 +110,18 @@ export const useStore = create<AppState>((set, get) => ({
   setMapView: (extent, zoom) => set({ mapExtent: extent, mapZoom: zoom }),
   showCsidcReference: false,
   toggleCsidcReference: () => {
-    const state = get();
-    const newVal = !state.showCsidcReference;
-    set({ showCsidcReference: newVal });
-    // Auto-load reference plots when toggling on + area selected
-    if (newVal && state.selectedArea && state.csidcReferencePlots.length === 0) {
-      state.loadCsidcReferencePlots(state.selectedArea.name);
-    }
+    set((s) => ({ showCsidcReference: !s.showCsidcReference }));
   },
-  csidcReferencePlots: [],
-  csidcReferenceLoading: false,
-  loadCsidcReferencePlots: async (areaName) => {
-    set({ csidcReferenceLoading: true });
-    try {
-      const data = await api.fetchReferencePlots(areaName);
-      set({ csidcReferencePlots: data.plots, csidcReferenceLoading: false });
-      if (data.total === 0) {
-        get().showToast(`No CSIDC reference plots found for ${areaName}`, "info");
-      } else {
-        get().showToast(
-          `Loaded ${data.total} reference plots (${data.source})`,
-          "success"
-        );
+  hideDetectedPlots: false,
+  toggleHideDetectedPlots: () => {
+    set((s) => {
+      const newHide = !s.hideDetectedPlots;
+      // Auto-enable CSIDC reference when entering "CSIDC Only" mode
+      if (newHide && !s.showCsidcReference) {
+        return { hideDetectedPlots: newHide, showCsidcReference: true };
       }
-    } catch (e) {
-      set({ csidcReferenceLoading: false });
-      get().showToast(`Failed to load reference plots: ${e}`, "error");
-    }
+      return { hideDetectedPlots: newHide };
+    });
   },
   loadWMSConfig: async () => {
     try {
@@ -155,7 +147,7 @@ export const useStore = create<AppState>((set, get) => ({
       get().showToast(`Failed to load areas: ${e}`, "error");
     }
   },
-  selectArea: (area) => set({ selectedArea: area, areaBoundary: null, csidcReferencePlots: [] }),
+  selectArea: (area) => set({ selectedArea: area, areaBoundary: null }),
   setAreaBoundary: (boundary) => set({ areaBoundary: boundary }),
 
   // ---- Project ----
@@ -218,6 +210,46 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       get().showToast(`Failed to remove plot: ${e}`, "error");
     }
+  },
+
+  // ---- Boundary Editing ----
+  editingPlotId: null,
+  editingGeometry: null,
+  startEditing: (plotId) => {
+    const project = get().activeProject;
+    if (!project) return;
+    const plot = project.plots?.find((p) => p.id === plotId);
+    if (!plot) return;
+    set({
+      editingPlotId: plotId,
+      editingGeometry: plot.geometry,
+      selectedPlotId: plotId,
+    });
+  },
+  cancelEditing: () => {
+    const project = get().activeProject;
+    set({ editingPlotId: null, editingGeometry: null });
+    // Reload project to restore original geometry on the map
+    if (project) {
+      get().loadProject(project.id);
+    }
+  },
+  saveEditing: async () => {
+    const { editingPlotId, editingGeometry, activeProject, showToast } = get();
+    if (!editingPlotId || !editingGeometry || !activeProject) return;
+    try {
+      await api.updatePlot(activeProject.id, editingPlotId, {
+        geometry: editingGeometry,
+      });
+      set({ editingPlotId: null, editingGeometry: null });
+      await get().loadProject(activeProject.id);
+      showToast("Boundary updated", "success");
+    } catch (e) {
+      showToast(`Failed to save boundary: ${e}`, "error");
+    }
+  },
+  updateEditingGeometry: (geom) => {
+    set({ editingGeometry: geom });
   },
 
   // ---- Detection ----

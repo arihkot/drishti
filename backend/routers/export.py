@@ -3,6 +3,7 @@
 import json
 import logging
 
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -10,8 +11,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from backend.config import settings
 from backend.database import get_db
-from backend.models import BasemapCache, Comparison, Plot, Project
+from backend.models import BasemapCache, Comparison, CsidcReferencePlot, Plot, Project
+from backend.services.tile_fetcher import bbox_hash
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -111,6 +114,50 @@ async def export_pdf(
                 for c in comparisons
             ]
 
+    # Load cached satellite image for the project's bbox/zoom
+    satellite_image = None
+    satellite_meta = None
+    if project.bbox_json:
+        try:
+            bbox = json.loads(project.bbox_json)
+            zoom = project.zoom or settings.DEFAULT_TILE_ZOOM
+            cache_key = bbox_hash(bbox, zoom)
+            cache_path = settings.TILES_DIR / f"{cache_key}.npy"
+            meta_path = settings.TILES_DIR / f"{cache_key}_meta.npy"
+            if cache_path.exists() and meta_path.exists():
+                satellite_image = np.load(str(cache_path))
+                satellite_meta = np.load(str(meta_path), allow_pickle=True).item()
+                logger.info(f"Loaded cached satellite image: {cache_key}")
+            else:
+                logger.warning(f"Satellite cache not found for key {cache_key}")
+        except Exception as e:
+            logger.warning(f"Failed to load satellite image cache: {e}")
+
+    # Extract boundary geometry from basemap features
+    boundary_geom = None
+    if basemap_features:
+        boundary_geom = basemap_features[0].get("geometry")
+
+    # Load CSIDC reference plots for the area
+    csidc_ref_plots = []
+    if project.area_name:
+        ref_result = await db.execute(
+            select(CsidcReferencePlot).where(
+                CsidcReferencePlot.area_name == project.area_name
+            )
+        )
+        for ref in ref_result.scalars().all():
+            csidc_ref_plots.append(
+                {
+                    "geometry": ref.geometry,
+                    "plot_name": ref.plot_name,
+                    "properties": ref.properties,
+                }
+            )
+        logger.info(
+            f"Loaded {len(csidc_ref_plots)} CSIDC reference plots for {project.area_name}"
+        )
+
     # Generate PDF
     try:
         pdf_path = generate_pdf_report(
@@ -120,6 +167,10 @@ async def export_pdf(
             basemap_features=basemap_features if basemap_features else None,
             deviations=deviations if deviations else None,
             comparison_summary=comparison_summary,
+            satellite_image=satellite_image,
+            satellite_meta=satellite_meta,
+            boundary_geom=boundary_geom,
+            csidc_ref_plots=csidc_ref_plots if csidc_ref_plots else None,
         )
 
         return FileResponse(

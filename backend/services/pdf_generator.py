@@ -1,4 +1,4 @@
-"""PDF report generator."""
+"""PDF report generator — CSIDC-branded, professional layout."""
 
 import io
 import logging
@@ -12,7 +12,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
-from matplotlib.collections import PatchCollection
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -25,23 +24,152 @@ from reportlab.platypus import (
     Spacer,
     Table,
     TableStyle,
+    KeepTogether,
 )
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from shapely.geometry import shape
 
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# CSIDC Brand Colors
+# ---------------------------------------------------------------------------
+CSIDC_BLUE = "#0D47A1"
+CSIDC_BLUE_LIGHT = "#1976D2"
+CSIDC_DARK = "#1B2631"
+CSIDC_GRAY = "#5D6D7E"
+CSIDC_BG = "#E3F2FD"
 
+# Category styling — matches frontend 3-category system (plot, road, boundary)
+CATEGORY_STYLES: dict[str, dict[str, str]] = {
+    "plot": {"fill": "rgba(239,68,68,0.20)", "stroke": "#ef4444", "label": "Plot"},
+    "road": {"fill": "rgba(100,116,139,0.15)", "stroke": "#64748b", "label": "Road"},
+    "boundary": {
+        "fill": "rgba(249,115,22,0.10)",
+        "stroke": "#f97316",
+        "label": "Boundary",
+    },
+    # Legacy
+    "parcel": {"fill": "rgba(239,68,68,0.20)", "stroke": "#ef4444", "label": "Parcel"},
+}
+
+DEVIATION_COLORS: dict[str, str] = {
+    "ENCROACHMENT": "#ef4444",
+    "BOUNDARY_MISMATCH": "#f97316",
+    "VACANT": "#eab308",
+    "UNAUTHORIZED_DEVELOPMENT": "#dc2626",
+    "COMPLIANT": "#22c55e",
+}
+
+SEVERITY_BG: dict[str, str] = {
+    "low": "#dcfce7",
+    "medium": "#fef9c3",
+    "high": "#ffedd5",
+    "critical": "#fee2e2",
+}
+
+
+def _hex_to_rgba(hex_color: str, alpha: float = 1.0) -> tuple[float, ...]:
+    """Convert hex color to matplotlib RGBA tuple (0-1 range)."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
+    return (r, g, b, alpha)
+
+
+def _parse_rgba_string(s: str) -> tuple[float, ...]:
+    """Parse 'rgba(r,g,b,a)' string to matplotlib tuple."""
+    inner = s.replace("rgba(", "").replace(")", "")
+    parts = [float(x.strip()) for x in inner.split(",")]
+    return (parts[0] / 255, parts[1] / 255, parts[2] / 255, parts[3])
+
+
+def _draw_geometry(
+    ax, geom, fill_color, stroke_color, stroke_width=1.5, zorder=3, hatch=None
+):
+    """Draw a shapely geometry (Polygon or MultiPolygon) on a matplotlib axis."""
+    if geom.geom_type == "Polygon":
+        if hasattr(geom, "exterior"):
+            x, y = geom.exterior.xy
+            ax.fill(
+                x,
+                y,
+                alpha=fill_color[3] if len(fill_color) > 3 else 0.2,
+                color=fill_color[:3],
+                hatch=hatch,
+                zorder=zorder - 1,
+            )
+            ax.plot(x, y, color=stroke_color, linewidth=stroke_width, zorder=zorder)
+    elif geom.geom_type == "MultiPolygon":
+        for poly in geom.geoms:
+            _draw_geometry(
+                ax, poly, fill_color, stroke_color, stroke_width, zorder, hatch
+            )
+
+
+# ---------------------------------------------------------------------------
+# Page header/footer template
+# ---------------------------------------------------------------------------
+def _page_template(canvas, doc):
+    """Draw CSIDC-branded header and footer on every page."""
+    canvas.saveState()
+    page_width, page_height = landscape(A4)
+
+    # --- Header bar ---
+    # Orange gradient bar at top
+    canvas.setFillColor(colors.HexColor(CSIDC_BLUE))
+    canvas.rect(0, page_height - 28, page_width, 28, fill=1, stroke=0)
+
+    # Header text
+    canvas.setFillColor(colors.white)
+    canvas.setFont("Helvetica-Bold", 9)
+    canvas.drawString(
+        20,
+        page_height - 20,
+        "CHHATTISGARH STATE INDUSTRIAL DEVELOPMENT CORPORATION (CSIDC)",
+    )
+    canvas.setFont("Helvetica", 8)
+    canvas.drawRightString(
+        page_width - 20, page_height - 20, "Drishti — Automated Land Monitoring System"
+    )
+
+    # Thin accent line below header
+    canvas.setStrokeColor(colors.HexColor(CSIDC_BLUE_LIGHT))
+    canvas.setLineWidth(1.5)
+    canvas.line(0, page_height - 30, page_width, page_height - 30)
+
+    # --- Footer ---
+    canvas.setStrokeColor(colors.HexColor(CSIDC_GRAY))
+    canvas.setLineWidth(0.5)
+    canvas.line(20, 25, page_width - 20, 25)
+
+    canvas.setFillColor(colors.HexColor(CSIDC_GRAY))
+    canvas.setFont("Helvetica", 7)
+    canvas.drawString(20, 13, "CONFIDENTIAL — For CSIDC Internal Use Only")
+    canvas.drawCentredString(
+        page_width / 2,
+        13,
+        f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+    )
+    canvas.drawRightString(page_width - 20, 13, f"Page {canvas.getPageNumber()}")
+
+    canvas.restoreState()
+
+
+# ---------------------------------------------------------------------------
+# Schematic Map Renderer
+# ---------------------------------------------------------------------------
 def _render_schematic(
     plots: list[dict],
     basemap_features: list[dict] | None = None,
     deviations: list[dict] | None = None,
     title: str = "Land Parcel Schematic",
+    figsize: tuple[float, float] = (16, 10),
 ) -> bytes:
-    """Render a CAD-style schematic of plots as PNG bytes."""
-    fig, ax = plt.subplots(1, 1, figsize=(14, 10), dpi=150)
-    ax.set_facecolor("white")
+    """Render a professional schematic of all plots as PNG bytes."""
+    fig, ax = plt.subplots(1, 1, figsize=figsize, dpi=150)
+    ax.set_facecolor("#fafafa")
     fig.patch.set_facecolor("white")
 
     # Draw basemap boundaries if available
@@ -49,111 +177,134 @@ def _render_schematic(
         for feature in basemap_features:
             try:
                 geom = shape(feature.get("geometry", feature))
-                if hasattr(geom, "exterior"):
-                    x, y = geom.exterior.xy
-                    ax.plot(
-                        x, y, color="#00CED1", linewidth=2.5, linestyle="-", zorder=2
-                    )
-                    ax.fill(x, y, alpha=0.05, color="#00CED1")
+                _draw_geometry(
+                    ax,
+                    geom,
+                    fill_color=(0, 0.8, 0.85, 0.06),
+                    stroke_color="#00897B",
+                    stroke_width=2.5,
+                    zorder=2,
+                )
             except Exception:
                 continue
 
-    # Draw detected plots
+    # Draw detected plots with category-specific styling
     for i, plot in enumerate(plots):
         try:
             geom = shape(plot["geometry"])
-            category = plot.get("category", "parcel")
-            color = plot.get("color", "#FF0000")
+            category = plot.get("category", "plot")
+            style = CATEGORY_STYLES.get(category, CATEGORY_STYLES["plot"])
+            fill_rgba = _parse_rgba_string(style["fill"])
+            stroke_hex = style["stroke"]
+
+            hatch = "///" if category in ("plot", "parcel") else None
+            _draw_geometry(
+                ax, geom, fill_rgba, stroke_hex, stroke_width=1.5, zorder=3, hatch=hatch
+            )
+
+            # Label at centroid
             label = plot.get("label", f"Plot {i + 1}")
-
-            if hasattr(geom, "exterior"):
-                x, y = geom.exterior.xy
-                ax.plot(x, y, color=color, linewidth=1.5, zorder=3)
-
-                # Hatching for parcels
-                if category == "parcel":
-                    ax.fill(x, y, alpha=0.15, color=color, hatch="///", zorder=1)
-                elif category == "road":
-                    ax.fill(x, y, alpha=0.1, color=color, zorder=1)
-
-                # Label at centroid
-                cx, cy = geom.centroid.x, geom.centroid.y
-                ax.annotate(
-                    label,
-                    (cx, cy),
-                    fontsize=5,
-                    ha="center",
-                    va="center",
-                    fontweight="bold",
-                    color="#333333",
-                    bbox=dict(
-                        boxstyle="round,pad=0.2",
-                        facecolor="white",
-                        edgecolor=color,
-                        alpha=0.9,
-                    ),
-                    zorder=5,
-                )
+            cx, cy = geom.centroid.x, geom.centroid.y
+            ax.annotate(
+                label,
+                (cx, cy),
+                fontsize=5,
+                ha="center",
+                va="center",
+                fontweight="bold",
+                color="#333333",
+                bbox=dict(
+                    boxstyle="round,pad=0.15",
+                    facecolor="white",
+                    edgecolor=stroke_hex,
+                    alpha=0.92,
+                    linewidth=0.6,
+                ),
+                zorder=5,
+            )
         except Exception:
             continue
 
-    # Draw deviations if available
+    # Draw deviations
     if deviations:
         for dev in deviations:
             if dev.get("deviation_geometry"):
                 try:
                     geom = shape(dev["deviation_geometry"])
-                    if hasattr(geom, "exterior"):
-                        x, y = geom.exterior.xy
-                        dev_type = dev.get("deviation_type", "")
-                        if dev_type == "ENCROACHMENT":
-                            ax.fill(x, y, alpha=0.4, color="#FF6600", zorder=4)
-                            ax.plot(
-                                x,
-                                y,
-                                color="#FF6600",
-                                linewidth=2,
-                                linestyle="--",
-                                zorder=4,
-                            )
-                        elif dev_type == "VACANT":
-                            ax.fill(x, y, alpha=0.3, color="#808080", zorder=4)
+                    dev_type = dev.get("deviation_type", "")
+                    dev_color = DEVIATION_COLORS.get(dev_type, "#9ca3af")
+                    dev_rgba = _hex_to_rgba(dev_color, 0.35)
+                    _draw_geometry(
+                        ax, geom, dev_rgba, dev_color, stroke_width=2, zorder=4
+                    )
                 except Exception:
                     continue
 
-    ax.set_title(title, fontsize=14, fontweight="bold", pad=15)
-    ax.set_xlabel("Longitude", fontsize=10)
-    ax.set_ylabel("Latitude", fontsize=10)
+    ax.set_title(
+        title,
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+        color=CSIDC_DARK,
+        fontfamily="sans-serif",
+    )
+    ax.set_xlabel("Longitude", fontsize=9, color=CSIDC_GRAY)
+    ax.set_ylabel("Latitude", fontsize=9, color=CSIDC_GRAY)
     ax.set_aspect("equal")
-    ax.grid(True, alpha=0.2, linestyle="--")
+    ax.grid(True, alpha=0.15, linestyle="--", color="#aaa")
+    ax.tick_params(labelsize=7, colors=CSIDC_GRAY)
 
-    # Legend
-    legend_elements = [
-        mpatches.Patch(
-            facecolor="#FF000025",
-            edgecolor="#FF0000",
-            label="Detected Parcel",
-            hatch="///",
-        ),
-        mpatches.Patch(
-            facecolor="#00CED125", edgecolor="#00CED1", label="Basemap Boundary"
-        ),
-    ]
-    if deviations:
-        legend_elements.extend(
-            [
+    # Legend with all categories present in data
+    seen_categories = set()
+    for p in plots:
+        seen_categories.add(p.get("category", "plot"))
+
+    legend_elements = []
+    for cat_key in ["plot", "road", "boundary"]:
+        if cat_key in seen_categories:
+            st = CATEGORY_STYLES[cat_key]
+            fill_rgba = _parse_rgba_string(st["fill"])
+            legend_elements.append(
                 mpatches.Patch(
-                    facecolor="#FF660066", edgecolor="#FF6600", label="Encroachment"
-                ),
-                mpatches.Patch(
-                    facecolor="#80808050", edgecolor="#808080", label="Vacant"
-                ),
-            ]
+                    facecolor=fill_rgba[:3] + (fill_rgba[3],),
+                    edgecolor=st["stroke"],
+                    label=st["label"],
+                    linewidth=1.2,
+                )
+            )
+    if basemap_features:
+        legend_elements.append(
+            mpatches.Patch(
+                facecolor=(0, 0.8, 0.85, 0.06),
+                edgecolor="#00897B",
+                label="CSIDC Boundary",
+                linewidth=1.2,
+            )
         )
-    ax.legend(handles=legend_elements, loc="upper right", fontsize=8)
+    if deviations:
+        for dev_type, dev_color in DEVIATION_COLORS.items():
+            if any(d.get("deviation_type") == dev_type for d in deviations):
+                legend_elements.append(
+                    mpatches.Patch(
+                        facecolor=_hex_to_rgba(dev_color, 0.35),
+                        edgecolor=dev_color,
+                        label=dev_type.replace("_", " ").title(),
+                        linewidth=1.2,
+                    )
+                )
+
+    if legend_elements:
+        leg = ax.legend(
+            handles=legend_elements,
+            loc="upper right",
+            fontsize=7,
+            framealpha=0.92,
+            edgecolor="#ddd",
+            fancybox=True,
+        )
+        leg.get_frame().set_linewidth(0.5)
 
     plt.tight_layout()
-
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
     plt.close(fig)
@@ -161,6 +312,609 @@ def _render_schematic(
     return buf.read()
 
 
+# ---------------------------------------------------------------------------
+# CSIDC Reference Schematic Renderer
+# ---------------------------------------------------------------------------
+def _render_csidc_ref_schematic(
+    csidc_ref_plots: list[dict],
+    boundary_geom: dict | None = None,
+    title: str = "CSIDC Reference Plots — Schematic",
+    figsize: tuple[float, float] = (16, 10),
+) -> bytes:
+    """Render a CAD-style schematic of CSIDC reference plots as PNG bytes."""
+    fig, ax = plt.subplots(1, 1, figsize=figsize, dpi=150)
+    ax.set_facecolor("#fafafa")
+    fig.patch.set_facecolor("white")
+
+    # Draw outer boundary
+    if boundary_geom:
+        try:
+            geom = shape(boundary_geom)
+            _draw_geometry(
+                ax,
+                geom,
+                fill_color=(0.05, 0.28, 0.63, 0.04),
+                stroke_color="#1976D2",
+                stroke_width=2.5,
+                zorder=2,
+            )
+        except Exception:
+            pass
+
+    # Draw CSIDC reference plots
+    ref_stroke = "#00897B"
+    ref_fill = (0, 0.55, 0.48, 0.12)
+    for i, ref in enumerate(csidc_ref_plots):
+        try:
+            geom = shape(ref["geometry"])
+            _draw_geometry(
+                ax,
+                geom,
+                fill_color=ref_fill,
+                stroke_color=ref_stroke,
+                stroke_width=1.5,
+                zorder=3,
+                hatch="...",
+            )
+
+            # Label at centroid
+            label = ref.get("plot_name") or f"Ref {i + 1}"
+            cx, cy = geom.centroid.x, geom.centroid.y
+            ax.annotate(
+                label,
+                (cx, cy),
+                fontsize=4.5,
+                ha="center",
+                va="center",
+                fontweight="bold",
+                color="#1B2631",
+                bbox=dict(
+                    boxstyle="round,pad=0.12",
+                    facecolor="white",
+                    edgecolor=ref_stroke,
+                    alpha=0.90,
+                    linewidth=0.5,
+                ),
+                zorder=5,
+            )
+        except Exception:
+            continue
+
+    ax.set_title(
+        title,
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+        color=CSIDC_DARK,
+        fontfamily="sans-serif",
+    )
+    ax.set_xlabel("Longitude", fontsize=9, color=CSIDC_GRAY)
+    ax.set_ylabel("Latitude", fontsize=9, color=CSIDC_GRAY)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.15, linestyle="--", color="#aaa")
+    ax.tick_params(labelsize=7, colors=CSIDC_GRAY)
+
+    # Legend
+    legend_elements = [
+        mpatches.Patch(
+            facecolor=ref_fill,
+            edgecolor=ref_stroke,
+            label=f"CSIDC Reference Plots ({len(csidc_ref_plots)})",
+            linewidth=1.2,
+        )
+    ]
+    if boundary_geom:
+        legend_elements.append(
+            mpatches.Patch(
+                facecolor=(0.05, 0.28, 0.63, 0.04),
+                edgecolor="#1976D2",
+                label="CSIDC Outer Boundary",
+                linewidth=1.2,
+            )
+        )
+    leg = ax.legend(
+        handles=legend_elements,
+        loc="upper right",
+        fontsize=7,
+        framealpha=0.92,
+        edgecolor="#ddd",
+        fancybox=True,
+    )
+    leg.get_frame().set_linewidth(0.5)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+# ---------------------------------------------------------------------------
+# Satellite + Overlay Renderer
+# ---------------------------------------------------------------------------
+def _render_satellite_overlay(
+    satellite_image: np.ndarray,
+    meta: dict,
+    plots: list[dict],
+    boundary_geom: dict | None = None,
+    title: str = "Satellite Imagery with Detected Boundaries",
+) -> bytes:
+    """Render the satellite image with plot boundaries overlaid."""
+    fig, ax = plt.subplots(1, 1, figsize=(16, 10), dpi=150)
+    fig.patch.set_facecolor("white")
+
+    bbox = meta["bbox"]
+    ax.imshow(
+        satellite_image,
+        extent=[bbox[0], bbox[2], bbox[1], bbox[3]],
+        aspect="auto",
+        zorder=1,
+    )
+
+    # Overlay boundary
+    if boundary_geom:
+        try:
+            geom = shape(boundary_geom)
+            _draw_geometry(
+                ax,
+                geom,
+                fill_color=(0.05, 0.28, 0.63, 0.05),
+                stroke_color="#1976D2",
+                stroke_width=2.5,
+                zorder=2,
+            )
+        except Exception:
+            pass
+
+    # Overlay plots
+    for i, plot in enumerate(plots):
+        try:
+            geom = shape(plot["geometry"])
+            color = plot.get("color", "#3b82f6")
+            label = plot.get("label", f"Plot {i + 1}")
+
+            stroke_rgba = _hex_to_rgba(color)
+            _draw_geometry(
+                ax,
+                geom,
+                fill_color=_hex_to_rgba(color, 0.25),
+                stroke_color=color,
+                stroke_width=1.2,
+                zorder=3,
+            )
+
+            cx, cy = geom.centroid.x, geom.centroid.y
+            ax.annotate(
+                label,
+                (cx, cy),
+                fontsize=4.5,
+                ha="center",
+                va="center",
+                fontweight="bold",
+                color="white",
+                bbox=dict(
+                    boxstyle="round,pad=0.12", facecolor="black", alpha=0.6, linewidth=0
+                ),
+                zorder=5,
+            )
+        except Exception:
+            continue
+
+    ax.set_title(
+        title,
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+        color=CSIDC_DARK,
+        fontfamily="sans-serif",
+    )
+    ax.set_xlabel("Longitude", fontsize=9, color=CSIDC_GRAY)
+    ax.set_ylabel("Latitude", fontsize=9, color=CSIDC_GRAY)
+    ax.tick_params(labelsize=7, colors=CSIDC_GRAY)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+# ---------------------------------------------------------------------------
+# CSIDC Reference Overlay Renderer
+# ---------------------------------------------------------------------------
+def _render_csidc_ref_overlay(
+    satellite_image: np.ndarray,
+    meta: dict,
+    csidc_ref_plots: list[dict],
+    boundary_geom: dict | None = None,
+    title: str = "CSIDC Reference Plots — Satellite Overlay",
+) -> bytes:
+    """Render the satellite image with CSIDC reference plot boundaries overlaid."""
+    fig, ax = plt.subplots(1, 1, figsize=(16, 10), dpi=150)
+    fig.patch.set_facecolor("white")
+
+    bbox = meta["bbox"]
+    ax.imshow(
+        satellite_image,
+        extent=[bbox[0], bbox[2], bbox[1], bbox[3]],
+        aspect="auto",
+        zorder=1,
+    )
+
+    # Draw outer boundary
+    if boundary_geom:
+        try:
+            geom = shape(boundary_geom)
+            _draw_geometry(
+                ax,
+                geom,
+                fill_color=(0.05, 0.28, 0.63, 0.05),
+                stroke_color="#1976D2",
+                stroke_width=2.5,
+                zorder=2,
+            )
+        except Exception:
+            pass
+
+    # Draw CSIDC reference plots
+    ref_color = "#00E676"  # bright green for reference plots
+    for i, ref in enumerate(csidc_ref_plots):
+        try:
+            geom = shape(ref["geometry"])
+            _draw_geometry(
+                ax,
+                geom,
+                fill_color=_hex_to_rgba(ref_color, 0.15),
+                stroke_color=ref_color,
+                stroke_width=1.5,
+                zorder=3,
+            )
+
+            # Label with plot name if available
+            label = ref.get("plot_name") or f"Ref {i + 1}"
+            cx, cy = geom.centroid.x, geom.centroid.y
+            ax.annotate(
+                label,
+                (cx, cy),
+                fontsize=4,
+                ha="center",
+                va="center",
+                fontweight="bold",
+                color="white",
+                bbox=dict(
+                    boxstyle="round,pad=0.1",
+                    facecolor="#00897B",
+                    alpha=0.7,
+                    linewidth=0,
+                ),
+                zorder=5,
+            )
+        except Exception:
+            continue
+
+    # Legend
+    legend_elements = [
+        mpatches.Patch(
+            facecolor=_hex_to_rgba(ref_color, 0.15),
+            edgecolor=ref_color,
+            label=f"CSIDC Reference Plots ({len(csidc_ref_plots)})",
+            linewidth=1.2,
+        )
+    ]
+    if boundary_geom:
+        legend_elements.append(
+            mpatches.Patch(
+                facecolor=(0.05, 0.28, 0.63, 0.05),
+                edgecolor="#1976D2",
+                label="CSIDC Outer Boundary",
+                linewidth=1.2,
+            )
+        )
+    leg = ax.legend(
+        handles=legend_elements,
+        loc="upper right",
+        fontsize=7,
+        framealpha=0.92,
+        edgecolor="#ddd",
+        fancybox=True,
+    )
+    leg.get_frame().set_linewidth(0.5)
+
+    ax.set_title(
+        title,
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+        color=CSIDC_DARK,
+        fontfamily="sans-serif",
+    )
+    ax.set_xlabel("Longitude", fontsize=9, color=CSIDC_GRAY)
+    ax.set_ylabel("Latitude", fontsize=9, color=CSIDC_GRAY)
+    ax.tick_params(labelsize=7, colors=CSIDC_GRAY)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+# ---------------------------------------------------------------------------
+# Combined Overlay Renderer (Detected + CSIDC Reference)
+# ---------------------------------------------------------------------------
+def _render_combined_overlay(
+    satellite_image: np.ndarray,
+    meta: dict,
+    plots: list[dict],
+    csidc_ref_plots: list[dict],
+    boundary_geom: dict | None = None,
+    title: str = "Combined View — Detected & CSIDC Reference Plots",
+) -> bytes:
+    """Render satellite image with both detected and CSIDC reference boundaries."""
+    fig, ax = plt.subplots(1, 1, figsize=(16, 10), dpi=150)
+    fig.patch.set_facecolor("white")
+
+    bbox = meta["bbox"]
+    ax.imshow(
+        satellite_image,
+        extent=[bbox[0], bbox[2], bbox[1], bbox[3]],
+        aspect="auto",
+        zorder=1,
+    )
+
+    # Layer 1: Outer boundary
+    if boundary_geom:
+        try:
+            geom = shape(boundary_geom)
+            _draw_geometry(
+                ax,
+                geom,
+                fill_color=(0.05, 0.28, 0.63, 0.05),
+                stroke_color="#1976D2",
+                stroke_width=2.5,
+                zorder=2,
+            )
+        except Exception:
+            pass
+
+    # Layer 2: CSIDC reference plots (green, drawn first so detected overlays on top)
+    ref_color = "#00E676"
+    for i, ref in enumerate(csidc_ref_plots):
+        try:
+            geom = shape(ref["geometry"])
+            _draw_geometry(
+                ax,
+                geom,
+                fill_color=_hex_to_rgba(ref_color, 0.10),
+                stroke_color=ref_color,
+                stroke_width=1.2,
+                zorder=3,
+            )
+        except Exception:
+            continue
+
+    # Layer 3: Detected plots (category colors, on top)
+    for i, plot in enumerate(plots):
+        try:
+            geom = shape(plot["geometry"])
+            color = plot.get("color", "#3b82f6")
+            label = plot.get("label", f"Plot {i + 1}")
+
+            _draw_geometry(
+                ax,
+                geom,
+                fill_color=_hex_to_rgba(color, 0.20),
+                stroke_color=color,
+                stroke_width=1.4,
+                zorder=4,
+            )
+
+            cx, cy = geom.centroid.x, geom.centroid.y
+            ax.annotate(
+                label,
+                (cx, cy),
+                fontsize=4.5,
+                ha="center",
+                va="center",
+                fontweight="bold",
+                color="white",
+                bbox=dict(
+                    boxstyle="round,pad=0.12",
+                    facecolor="black",
+                    alpha=0.6,
+                    linewidth=0,
+                ),
+                zorder=6,
+            )
+        except Exception:
+            continue
+
+    # Legend
+    legend_elements = [
+        mpatches.Patch(
+            facecolor=_hex_to_rgba("#ef4444", 0.20),
+            edgecolor="#ef4444",
+            label=f"Detected Plots ({len(plots)})",
+            linewidth=1.2,
+        ),
+        mpatches.Patch(
+            facecolor=_hex_to_rgba(ref_color, 0.10),
+            edgecolor=ref_color,
+            label=f"CSIDC Reference ({len(csidc_ref_plots)})",
+            linewidth=1.2,
+        ),
+    ]
+    if boundary_geom:
+        legend_elements.append(
+            mpatches.Patch(
+                facecolor=(0.05, 0.28, 0.63, 0.05),
+                edgecolor="#1976D2",
+                label="CSIDC Outer Boundary",
+                linewidth=1.2,
+            )
+        )
+    leg = ax.legend(
+        handles=legend_elements,
+        loc="upper right",
+        fontsize=7,
+        framealpha=0.92,
+        edgecolor="#ddd",
+        fancybox=True,
+    )
+    leg.get_frame().set_linewidth(0.5)
+
+    ax.set_title(
+        title,
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+        color=CSIDC_DARK,
+        fontfamily="sans-serif",
+    )
+    ax.set_xlabel("Longitude", fontsize=9, color=CSIDC_GRAY)
+    ax.set_ylabel("Latitude", fontsize=9, color=CSIDC_GRAY)
+    ax.tick_params(labelsize=7, colors=CSIDC_GRAY)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+# ---------------------------------------------------------------------------
+# Individual Plot Detail Renderer
+# ---------------------------------------------------------------------------
+def _render_plot_detail_grid(
+    plots: list[dict],
+    satellite_image: np.ndarray | None = None,
+    meta: dict | None = None,
+    csidc_ref_plots: list[dict] | None = None,
+    cols: int = 3,
+    rows: int = 3,
+) -> list[bytes]:
+    """Render individual zoomed-in plot views, returning list of PNG page images."""
+    from shapely.geometry import box as shapely_box
+
+    pages: list[bytes] = []
+    per_page = cols * rows
+    plot_plots = [p for p in plots if p.get("category") in ("plot", "parcel")]
+    if not plot_plots:
+        plot_plots = plots  # Fall back to all if no "plot" category
+
+    # Pre-parse CSIDC ref geometries once for spatial lookups
+    ref_geoms: list[tuple[Any, dict]] = []
+    if csidc_ref_plots:
+        for ref in csidc_ref_plots:
+            try:
+                ref_geoms.append((shape(ref["geometry"]), ref))
+            except Exception:
+                continue
+
+    for page_start in range(0, len(plot_plots), per_page):
+        page_plots = plot_plots[page_start : page_start + per_page]
+        fig, axes = plt.subplots(rows, cols, figsize=(16, 10), dpi=150)
+        fig.patch.set_facecolor("white")
+        fig.suptitle(
+            "Individual Plot Details",
+            fontsize=13,
+            fontweight="bold",
+            color=CSIDC_DARK,
+            y=0.98,
+        )
+
+        flat_axes = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+        for idx, ax in enumerate(flat_axes):
+            if idx < len(page_plots):
+                plot = page_plots[idx]
+                try:
+                    geom = shape(plot["geometry"])
+                    category = plot.get("category", "plot")
+                    style = CATEGORY_STYLES.get(category, CATEGORY_STYLES["plot"])
+                    label = plot.get("label", f"Plot {idx + 1}")
+                    area_sqm = plot.get("area_sqm", 0)
+                    area_sqft = plot.get("area_sqft", 0)
+
+                    # Compute bounds with padding
+                    bounds = geom.bounds  # minx, miny, maxx, maxy
+                    dx = (bounds[2] - bounds[0]) * 0.3
+                    dy = (bounds[3] - bounds[1]) * 0.3
+                    pad = max(dx, dy, 0.0003)
+
+                    view_minx = bounds[0] - pad
+                    view_miny = bounds[1] - pad
+                    view_maxx = bounds[2] + pad
+                    view_maxy = bounds[3] + pad
+
+                    # Draw satellite background if available
+                    if satellite_image is not None and meta is not None:
+                        bbox_img = meta["bbox"]
+                        ax.imshow(
+                            satellite_image,
+                            extent=[bbox_img[0], bbox_img[2], bbox_img[1], bbox_img[3]],
+                            aspect="auto",
+                            zorder=1,
+                        )
+                    else:
+                        ax.set_facecolor("#f5f5f5")
+
+                    # Draw CSIDC reference plots that overlap this view
+                    if ref_geoms:
+                        view_box = shapely_box(
+                            view_minx, view_miny, view_maxx, view_maxy
+                        )
+                        ref_color = "#00E676"
+                        for ref_geom, ref_data in ref_geoms:
+                            if ref_geom.intersects(view_box):
+                                _draw_geometry(
+                                    ax,
+                                    ref_geom,
+                                    fill_color=_hex_to_rgba(ref_color, 0.10),
+                                    stroke_color=ref_color,
+                                    stroke_width=1.0,
+                                    zorder=2,
+                                )
+
+                    # Draw detected plot boundary (on top)
+                    fill_rgba = _parse_rgba_string(style["fill"])
+                    _draw_geometry(
+                        ax, geom, fill_rgba, style["stroke"], stroke_width=2, zorder=3
+                    )
+
+                    ax.set_xlim(view_minx, view_maxx)
+                    ax.set_ylim(view_miny, view_maxy)
+                    ax.set_aspect("equal")
+                    ax.set_title(
+                        f"{label}\n{area_sqm:,.0f} sqm / {area_sqft:,.0f} sqft",
+                        fontsize=7,
+                        fontweight="bold",
+                        color=CSIDC_DARK,
+                        pad=4,
+                    )
+                    ax.tick_params(labelsize=5, colors=CSIDC_GRAY)
+                except Exception:
+                    ax.set_visible(False)
+            else:
+                ax.set_visible(False)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        pages.append(buf.read())
+
+    return pages
+
+
+# ---------------------------------------------------------------------------
+# Main PDF Generator
+# ---------------------------------------------------------------------------
 def generate_pdf_report(
     project_name: str,
     area_name: str,
@@ -168,97 +922,164 @@ def generate_pdf_report(
     basemap_features: list[dict] | None = None,
     deviations: list[dict] | None = None,
     comparison_summary: dict | None = None,
+    satellite_image: np.ndarray | None = None,
+    satellite_meta: dict | None = None,
+    boundary_geom: dict | None = None,
+    csidc_ref_plots: list[dict] | None = None,
 ) -> Path:
-    """
-    Generate a PDF report.
+    """Generate a comprehensive, CSIDC-branded PDF report."""
 
-    Returns:
-        Path to the generated PDF file.
-    """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"drishti_report_{timestamp}.pdf"
     output_path = settings.EXPORTS_DIR / filename
+
+    page_w, page_h = landscape(A4)
 
     doc = SimpleDocTemplate(
         str(output_path),
         pagesize=landscape(A4),
         rightMargin=20 * mm,
         leftMargin=20 * mm,
-        topMargin=20 * mm,
-        bottomMargin=20 * mm,
+        topMargin=38,  # space for header bar
+        bottomMargin=32,  # space for footer
     )
 
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "CustomTitle",
+
+    # Custom styles
+    s_title = ParagraphStyle(
+        "CTitle",
         parent=styles["Title"],
-        fontSize=24,
-        textColor=colors.HexColor("#1a237e"),
-        spaceAfter=20,
+        fontSize=28,
+        textColor=colors.HexColor(CSIDC_DARK),
+        spaceAfter=6,
+        alignment=TA_CENTER,
     )
-    subtitle_style = ParagraphStyle(
-        "CustomSubtitle",
+    s_org = ParagraphStyle(
+        "COrg",
+        parent=styles["Title"],
+        fontSize=14,
+        textColor=colors.HexColor(CSIDC_BLUE),
+        spaceAfter=4,
+        alignment=TA_CENTER,
+    )
+    s_subtitle = ParagraphStyle(
+        "CSub",
         parent=styles["Heading2"],
         fontSize=16,
-        textColor=colors.HexColor("#283593"),
-        spaceAfter=10,
+        textColor=colors.HexColor(CSIDC_DARK),
+        spaceBefore=14,
+        spaceAfter=8,
     )
-    body_style = ParagraphStyle(
-        "CustomBody",
+    s_section = ParagraphStyle(
+        "CSec",
+        parent=styles["Heading3"],
+        fontSize=13,
+        textColor=colors.HexColor(CSIDC_BLUE),
+        spaceBefore=10,
+        spaceAfter=6,
+    )
+    s_body = ParagraphStyle(
+        "CBody",
         parent=styles["Normal"],
         fontSize=10,
         leading=14,
+        textColor=colors.HexColor(CSIDC_DARK),
     )
-    header_style = ParagraphStyle(
-        "Header",
-        parent=styles["Heading3"],
-        fontSize=13,
-        textColor=colors.HexColor("#1a237e"),
-        spaceBefore=15,
-        spaceAfter=8,
+    s_small = ParagraphStyle(
+        "CSmall",
+        parent=styles["Normal"],
+        fontSize=8,
+        leading=11,
+        textColor=colors.HexColor(CSIDC_GRAY),
+    )
+    s_center = ParagraphStyle("CCenter", parent=s_body, alignment=TA_CENTER)
+    s_meta_label = ParagraphStyle(
+        "CMetaL", parent=s_body, fontSize=10, textColor=colors.HexColor(CSIDC_GRAY)
+    )
+    s_meta_val = ParagraphStyle(
+        "CMetaV",
+        parent=s_body,
+        fontSize=11,
+        textColor=colors.HexColor(CSIDC_DARK),
+        fontName="Helvetica-Bold",
     )
 
-    elements = []
+    elements: list = []
 
-    # === Cover Page ===
-    elements.append(Spacer(1, 60))
-    elements.append(
-        Paragraph(
-            "CHHATTISGARH STATE INDUSTRIAL DEVELOPMENT CORPORATION",
-            ParagraphStyle(
-                "OrgTitle",
-                parent=styles["Title"],
-                fontSize=18,
-                textColor=colors.HexColor("#0d47a1"),
-            ),
+    # ===================================================================
+    # PAGE 1: COVER PAGE
+    # ===================================================================
+    elements.append(Spacer(1, 70))
+
+    # Orange accent line
+    cover_line = Table([[""]], colWidths=[page_w - 40 * mm], rowHeights=[3])
+    cover_line.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(CSIDC_BLUE)),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
         )
     )
-    elements.append(Spacer(1, 10))
-    elements.append(
-        Paragraph(
-            "Drishti - Automated Land Monitoring Report",
-            title_style,
-        )
-    )
+    elements.append(cover_line)
     elements.append(Spacer(1, 20))
-    elements.append(Paragraph(f"<b>Project:</b> {project_name}", body_style))
-    elements.append(Paragraph(f"<b>Area:</b> {area_name or 'N/A'}", body_style))
+
     elements.append(
-        Paragraph(
-            f"<b>Generated:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-            body_style,
-        )
+        Paragraph("CHHATTISGARH STATE INDUSTRIAL<br/>DEVELOPMENT CORPORATION", s_org)
     )
-    elements.append(Paragraph(f"<b>Total Plots Detected:</b> {len(plots)}", body_style))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph("Drishti — Automated Land Monitoring Report", s_title))
     elements.append(Spacer(1, 30))
 
-    # Summary statistics
+    # Project metadata table
+    now_str = datetime.now(timezone.utc).strftime("%d %B %Y, %H:%M UTC")
+    active_plots = [p for p in plots if p.get("category") in ("plot", "parcel")]
+    total_area_sqm = sum(p.get("area_sqm", 0) for p in plots)
+    total_area_sqft = sum(p.get("area_sqft", 0) for p in plots)
+
+    meta_data = [
+        ["Project Name", project_name],
+        ["Industrial Area", area_name or "N/A"],
+        ["Report Date", now_str],
+        ["Total Features Detected", str(len(plots))],
+        ["Plot Features", str(len(active_plots))],
+        [
+            "Total Area Covered",
+            f"{total_area_sqm:,.0f} sq.m ({total_area_sqft:,.0f} sq.ft)",
+        ],
+    ]
+    meta_table = Table(meta_data, colWidths=[180, 320])
+    meta_table.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 11),
+                ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor(CSIDC_GRAY)),
+                ("TEXTCOLOR", (1, 0), (1, -1), colors.HexColor(CSIDC_DARK)),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("LINEBELOW", (0, 0), (-1, -2), 0.3, colors.HexColor("#E0E0E0")),
+                ("ALIGN", (0, 0), (0, -1), "RIGHT"),
+                ("ALIGN", (1, 0), (1, -1), "LEFT"),
+                ("LEFTPADDING", (1, 0), (1, -1), 15),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
+    elements.append(meta_table)
+
+    # Compliance summary on cover if available
     if comparison_summary:
-        elements.append(Paragraph("Compliance Summary", subtitle_style))
-        summary_data = [
+        elements.append(Spacer(1, 25))
+        elements.append(Paragraph("Compliance Summary", s_section))
+
+        comp_data = [
             ["Metric", "Count"],
             [
-                "Total Detected Plots",
+                "Total Detected",
                 str(comparison_summary.get("total_detected", len(plots))),
             ],
             ["Compliant", str(comparison_summary.get("compliant", 0))],
@@ -268,163 +1089,661 @@ def generate_pdf_report(
                 str(comparison_summary.get("boundary_mismatch", 0)),
             ],
             ["Vacant Plots", str(comparison_summary.get("vacant", 0))],
-            [
-                "Unauthorized Development",
-                str(comparison_summary.get("unauthorized", 0)),
-            ],
+            ["Unauthorized", str(comparison_summary.get("unauthorized", 0))],
         ]
-        t = Table(summary_data, colWidths=[200, 100])
-        t.setStyle(
+        comp_table = Table(comp_data, colWidths=[200, 100])
+        comp_table.setStyle(
             TableStyle(
                 [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a237e")),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(CSIDC_BLUE)),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("FONTSIZE", (0, 0), (-1, -1), 10),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E0E0E0")),
                     (
                         "ROWBACKGROUNDS",
                         (0, 1),
                         (-1, -1),
-                        [colors.whitesmoke, colors.white],
+                        [colors.HexColor("#E3F2FD"), colors.white],
                     ),
                     ("ALIGN", (1, 0), (1, -1), "CENTER"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
                 ]
             )
         )
-        elements.append(t)
+        elements.append(comp_table)
 
     elements.append(PageBreak())
 
-    # === Schematic Map ===
-    elements.append(Paragraph("Plot Schematic", subtitle_style))
-
-    schematic_png = _render_schematic(
-        plots,
-        basemap_features,
-        deviations,
-        title=f"{project_name} - {area_name or 'Plot Map'}",
-    )
-    schematic_path = settings.EXPORTS_DIR / f"schematic_{timestamp}.png"
-    with open(schematic_path, "wb") as f:
-        f.write(schematic_png)
-
-    img = RLImage(str(schematic_path), width=700, height=450)
-    elements.append(img)
-    elements.append(PageBreak())
-
-    # === Plot Inventory ===
-    elements.append(Paragraph("Plot Inventory", subtitle_style))
-
-    plot_data = [
-        [
-            "#",
-            "Label",
-            "Category",
-            "Area (sq.m)",
-            "Area (sq.ft)",
-            "Perimeter (m)",
-            "Status",
-        ]
-    ]
-    for i, plot in enumerate(plots, 1):
-        status = "Active"
-        if deviations:
-            for dev in deviations:
-                if dev.get("plot_label") == plot.get("label"):
-                    status = dev.get("deviation_type", "Unknown")
-                    break
-
-        plot_data.append(
-            [
-                str(i),
-                plot.get("label", f"Plot {i}"),
-                plot.get("category", "parcel").capitalize(),
-                str(round(plot.get("area_sqm", 0), 1)),
-                str(round(plot.get("area_sqft", 0), 1)),
-                str(round(plot.get("perimeter_m", 0), 1)),
-                status,
-            ]
-        )
-
-    t = Table(plot_data, colWidths=[30, 120, 80, 80, 80, 80, 120])
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a237e")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
-                ("ALIGN", (0, 0), (0, -1), "CENTER"),
-                ("ALIGN", (3, 0), (5, -1), "RIGHT"),
-            ]
-        )
-    )
-    elements.append(t)
-
-    # === Deviation Details ===
-    if deviations:
-        elements.append(PageBreak())
-        elements.append(Paragraph("Deviation Details", subtitle_style))
-
-        for dev in deviations:
-            if dev.get("deviation_type") == "COMPLIANT":
-                continue
-
-            elements.append(
-                Paragraph(
-                    f"<b>{dev.get('plot_label', 'Unknown')}</b> - {dev.get('deviation_type', 'Unknown')}",
-                    header_style,
-                )
-            )
-            elements.append(Paragraph(dev.get("description", ""), body_style))
-
-            details = dev.get("details", {})
-            if details:
-                detail_data = [
-                    ["Detected Area", f"{details.get('detected_area_sqm', 0)} sq.m"],
-                    ["Basemap Area", f"{details.get('basemap_area_sqm', 0)} sq.m"],
-                    [
-                        "Encroachment Area",
-                        f"{details.get('encroachment_area_sqm', 0)} sq.m",
-                    ],
-                    ["Vacant Area", f"{details.get('vacant_area_sqm', 0)} sq.m"],
-                    ["Match %", f"{details.get('match_percentage', 0)}%"],
-                ]
-                t = Table(detail_data, colWidths=[150, 150])
-                t.setStyle(
-                    TableStyle(
-                        [
-                            ("FONTSIZE", (0, 0), (-1, -1), 9),
-                            ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-                            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-                        ]
-                    )
-                )
-                elements.append(t)
-                elements.append(Spacer(1, 10))
-
-    # === Footer ===
-    elements.append(Spacer(1, 30))
+    # ===================================================================
+    # PAGE 2: CATEGORY BREAKDOWN
+    # ===================================================================
+    elements.append(Paragraph("Category Breakdown", s_subtitle))
+    elements.append(Spacer(1, 6))
     elements.append(
         Paragraph(
-            "This report was generated by Drishti - Automated Land Monitoring System for CSIDC. "
-            "Data accuracy depends on satellite imagery resolution and SAM model predictions.",
+            "Summary of detected features grouped by category, showing count and total area.",
+            s_small,
+        )
+    )
+    elements.append(Spacer(1, 10))
+
+    # Compute category stats
+    category_stats: dict[str, dict[str, float]] = {}
+    for p in plots:
+        cat = p.get("category", "plot")
+        if cat not in category_stats:
+            category_stats[cat] = {
+                "count": 0,
+                "area_sqm": 0,
+                "area_sqft": 0,
+                "perimeter_m": 0,
+            }
+        category_stats[cat]["count"] += 1
+        category_stats[cat]["area_sqm"] += p.get("area_sqm", 0)
+        category_stats[cat]["area_sqft"] += p.get("area_sqft", 0)
+        category_stats[cat]["perimeter_m"] += p.get("perimeter_m", 0)
+
+    cat_header = [
+        "Category",
+        "Count",
+        "Total Area (sq.m)",
+        "Total Area (sq.ft)",
+        "Total Perimeter (m)",
+        "% of Total Area",
+    ]
+    cat_rows = [cat_header]
+    cat_order = ["plot", "road", "boundary"]
+    for cat in cat_order:
+        if cat in category_stats:
+            st = category_stats[cat]
+            pct = (st["area_sqm"] / total_area_sqm * 100) if total_area_sqm > 0 else 0
+            cat_label = CATEGORY_STYLES.get(cat, {}).get(
+                "label", cat.replace("_", " ").title()
+            )
+            cat_rows.append(
+                [
+                    cat_label,
+                    str(int(st["count"])),
+                    f"{st['area_sqm']:,.1f}",
+                    f"{st['area_sqft']:,.1f}",
+                    f"{st['perimeter_m']:,.1f}",
+                    f"{pct:.1f}%",
+                ]
+            )
+
+    # Totals row
+    cat_rows.append(
+        [
+            "TOTAL",
+            str(len(plots)),
+            f"{total_area_sqm:,.1f}",
+            f"{total_area_sqft:,.1f}",
+            f"{sum(s['perimeter_m'] for s in category_stats.values()):,.1f}",
+            "100.0%",
+        ]
+    )
+
+    cat_table = Table(cat_rows, colWidths=[100, 60, 110, 110, 110, 90])
+    num_cat_rows = len(cat_rows)
+    cat_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(CSIDC_BLUE)),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E0E0E0")),
+                (
+                    "ROWBACKGROUNDS",
+                    (0, 1),
+                    (-1, -2),
+                    [colors.HexColor("#E3F2FD"), colors.white],
+                ),
+                # Totals row bold
+                (
+                    "BACKGROUND",
+                    (0, num_cat_rows - 1),
+                    (-1, num_cat_rows - 1),
+                    colors.HexColor("#BBDEFB"),
+                ),
+                (
+                    "FONTNAME",
+                    (0, num_cat_rows - 1),
+                    (-1, num_cat_rows - 1),
+                    "Helvetica-Bold",
+                ),
+                ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+                ("ALIGN", (0, 0), (0, -1), "LEFT"),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    elements.append(cat_table)
+
+    # Category pie chart
+    elements.append(Spacer(1, 15))
+    try:
+        fig_pie, ax_pie = plt.subplots(1, 1, figsize=(6, 4), dpi=150)
+        fig_pie.patch.set_facecolor("white")
+
+        pie_labels = []
+        pie_sizes = []
+        pie_colors_list = []
+        for cat in cat_order:
+            if cat in category_stats and category_stats[cat]["area_sqm"] > 0:
+                st_info = CATEGORY_STYLES.get(cat, CATEGORY_STYLES["plot"])
+                pie_labels.append(st_info["label"])
+                pie_sizes.append(category_stats[cat]["area_sqm"])
+                pie_colors_list.append(st_info["stroke"])
+
+        if pie_sizes:
+            wedges, texts, autotexts = ax_pie.pie(
+                pie_sizes,
+                labels=pie_labels,
+                colors=pie_colors_list,
+                autopct="%1.1f%%",
+                pctdistance=0.8,
+                textprops={"fontsize": 8},
+                startangle=90,
+            )
+            for t in autotexts:
+                t.set_fontsize(7)
+                t.set_color("white")
+                t.set_fontweight("bold")
+            ax_pie.set_title(
+                "Area Distribution by Category",
+                fontsize=10,
+                fontweight="bold",
+                color=CSIDC_DARK,
+                pad=10,
+            )
+
+        pie_buf = io.BytesIO()
+        fig_pie.savefig(pie_buf, format="png", bbox_inches="tight", dpi=150)
+        plt.close(fig_pie)
+        pie_buf.seek(0)
+        pie_path = settings.EXPORTS_DIR / f"pie_{timestamp}.png"
+        with open(pie_path, "wb") as f:
+            f.write(pie_buf.read())
+        elements.append(RLImage(str(pie_path), width=340, height=220))
+    except Exception as e:
+        logger.warning(f"Failed to render pie chart: {e}")
+
+    elements.append(PageBreak())
+
+    # ===================================================================
+    # PAGE 3: SATELLITE IMAGERY WITH OVERLAY
+    # ===================================================================
+    if satellite_image is not None and satellite_meta is not None:
+        elements.append(
+            Paragraph("Satellite Imagery — Detected Boundaries", s_subtitle)
+        )
+        elements.append(Spacer(1, 4))
+        elements.append(
+            Paragraph(
+                "High-resolution satellite imagery with detected plot boundaries overlaid. "
+                "Source: ESRI World Imagery.",
+                s_small,
+            )
+        )
+        elements.append(Spacer(1, 8))
+
+        try:
+            sat_png = _render_satellite_overlay(
+                satellite_image,
+                satellite_meta,
+                plots,
+                boundary_geom=boundary_geom,
+                title=f"{area_name or project_name} — Satellite View",
+            )
+            sat_path = settings.EXPORTS_DIR / f"satellite_{timestamp}.png"
+            with open(sat_path, "wb") as f:
+                f.write(sat_png)
+            elements.append(RLImage(str(sat_path), width=700, height=420))
+        except Exception as e:
+            logger.warning(f"Failed to render satellite overlay: {e}")
+            elements.append(
+                Paragraph(f"<i>Satellite overlay rendering failed: {e}</i>", s_small)
+            )
+
+        elements.append(PageBreak())
+
+    # ===================================================================
+    # CSIDC REFERENCE PLOTS — SATELLITE OVERLAY
+    # ===================================================================
+    if csidc_ref_plots and satellite_image is not None and satellite_meta is not None:
+        elements.append(
+            Paragraph("CSIDC Reference Plots — Satellite Overlay", s_subtitle)
+        )
+        elements.append(Spacer(1, 4))
+        elements.append(
+            Paragraph(
+                f"Official CSIDC reference plot boundaries ({len(csidc_ref_plots)} plots) "
+                "overlaid on satellite imagery. These represent the allotted plot layout "
+                "as recorded in the CSIDC GeoServer database.",
+                s_small,
+            )
+        )
+        elements.append(Spacer(1, 8))
+
+        try:
+            ref_png = _render_csidc_ref_overlay(
+                satellite_image,
+                satellite_meta,
+                csidc_ref_plots,
+                boundary_geom=boundary_geom,
+                title=f"{area_name or project_name} — CSIDC Reference Plots",
+            )
+            ref_path = settings.EXPORTS_DIR / f"csidc_ref_{timestamp}.png"
+            with open(ref_path, "wb") as f:
+                f.write(ref_png)
+            elements.append(RLImage(str(ref_path), width=700, height=420))
+        except Exception as e:
+            logger.warning(f"Failed to render CSIDC ref overlay: {e}")
+            elements.append(
+                Paragraph(
+                    f"<i>CSIDC reference overlay rendering failed: {e}</i>", s_small
+                )
+            )
+
+        elements.append(PageBreak())
+
+    # ===================================================================
+    # COMBINED OVERLAY — DETECTED + CSIDC REFERENCE
+    # ===================================================================
+    if csidc_ref_plots and satellite_image is not None and satellite_meta is not None:
+        elements.append(
+            Paragraph("Combined View — Detected & CSIDC Reference Plots", s_subtitle)
+        )
+        elements.append(Spacer(1, 4))
+        elements.append(
+            Paragraph(
+                f"Side-by-side comparison: {len(plots)} detected boundaries (colored) "
+                f"and {len(csidc_ref_plots)} CSIDC reference plots (green) overlaid "
+                "on satellite imagery for visual deviation assessment.",
+                s_small,
+            )
+        )
+        elements.append(Spacer(1, 8))
+
+        try:
+            combined_png = _render_combined_overlay(
+                satellite_image,
+                satellite_meta,
+                plots,
+                csidc_ref_plots,
+                boundary_geom=boundary_geom,
+                title=f"{area_name or project_name} — Detected vs CSIDC Reference",
+            )
+            combined_path = settings.EXPORTS_DIR / f"combined_{timestamp}.png"
+            with open(combined_path, "wb") as f:
+                f.write(combined_png)
+            elements.append(RLImage(str(combined_path), width=700, height=420))
+        except Exception as e:
+            logger.warning(f"Failed to render combined overlay: {e}")
+            elements.append(
+                Paragraph(f"<i>Combined overlay rendering failed: {e}</i>", s_small)
+            )
+
+        elements.append(PageBreak())
+
+    # ===================================================================
+    # SCHEMATIC MAP
+    # ===================================================================
+    elements.append(Paragraph("Schematic Map — Plot Layout", s_subtitle))
+    elements.append(Spacer(1, 4))
+    elements.append(
+        Paragraph(
+            "CAD-style schematic view showing all detected features with category-specific styling.",
+            s_small,
+        )
+    )
+    elements.append(Spacer(1, 8))
+
+    try:
+        schematic_png = _render_schematic(
+            plots,
+            basemap_features,
+            deviations,
+            title=f"{area_name or project_name} — Schematic View",
+        )
+        schematic_path = settings.EXPORTS_DIR / f"schematic_{timestamp}.png"
+        with open(schematic_path, "wb") as f:
+            f.write(schematic_png)
+        elements.append(RLImage(str(schematic_path), width=700, height=420))
+    except Exception as e:
+        logger.warning(f"Failed to render schematic: {e}")
+        elements.append(Paragraph(f"<i>Schematic rendering failed: {e}</i>", s_small))
+
+    elements.append(PageBreak())
+
+    # ===================================================================
+    # CSIDC REFERENCE SCHEMATIC
+    # ===================================================================
+    if csidc_ref_plots:
+        elements.append(Paragraph("Schematic Map — CSIDC Reference Plots", s_subtitle))
+        elements.append(Spacer(1, 4))
+        elements.append(
+            Paragraph(
+                f"CAD-style schematic of {len(csidc_ref_plots)} official CSIDC reference "
+                "plot boundaries as recorded in the GeoServer database.",
+                s_small,
+            )
+        )
+        elements.append(Spacer(1, 8))
+
+        try:
+            ref_schematic_png = _render_csidc_ref_schematic(
+                csidc_ref_plots,
+                boundary_geom=boundary_geom,
+                title=f"{area_name or project_name} — CSIDC Reference Schematic",
+            )
+            ref_schematic_path = settings.EXPORTS_DIR / f"ref_schematic_{timestamp}.png"
+            with open(ref_schematic_path, "wb") as f:
+                f.write(ref_schematic_png)
+            elements.append(RLImage(str(ref_schematic_path), width=700, height=420))
+        except Exception as e:
+            logger.warning(f"Failed to render CSIDC ref schematic: {e}")
+            elements.append(
+                Paragraph(
+                    f"<i>CSIDC reference schematic rendering failed: {e}</i>",
+                    s_small,
+                )
+            )
+
+        elements.append(PageBreak())
+
+    # ===================================================================
+    # PAGE 5+: INDIVIDUAL PLOT DETAILS
+    # ===================================================================
+    try:
+        detail_pages = _render_plot_detail_grid(
+            plots,
+            satellite_image=satellite_image,
+            meta=satellite_meta,
+            csidc_ref_plots=csidc_ref_plots,
+            cols=3,
+            rows=3,
+        )
+        for page_idx, page_png in enumerate(detail_pages):
+            if page_idx == 0:
+                elements.append(Paragraph("Individual Plot Details", s_subtitle))
+                elements.append(Spacer(1, 4))
+                elements.append(
+                    Paragraph(
+                        "Zoomed-in view of each detected plot showing boundary detail and measurements.",
+                        s_small,
+                    )
+                )
+                elements.append(Spacer(1, 8))
+
+            detail_path = settings.EXPORTS_DIR / f"detail_{timestamp}_{page_idx}.png"
+            with open(detail_path, "wb") as f:
+                f.write(page_png)
+            elements.append(RLImage(str(detail_path), width=700, height=420))
+
+            if page_idx < len(detail_pages) - 1:
+                elements.append(PageBreak())
+
+    except Exception as e:
+        logger.warning(f"Failed to render plot details: {e}")
+
+    elements.append(PageBreak())
+
+    # ===================================================================
+    # PLOT INVENTORY TABLE (paginated with repeated headers)
+    # ===================================================================
+    elements.append(Paragraph("Plot Inventory", s_subtitle))
+    elements.append(Spacer(1, 4))
+    elements.append(
+        Paragraph(
+            f"Complete list of all {len(plots)} detected features with measurements.",
+            s_small,
+        )
+    )
+    elements.append(Spacer(1, 10))
+
+    inv_header = [
+        "#",
+        "Label",
+        "Category",
+        "Area (sq.m)",
+        "Area (sq.ft)",
+        "Perimeter (m)",
+        "Status",
+    ]
+    col_widths = [30, 130, 80, 80, 80, 80, 110]
+
+    header_style_table = TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(CSIDC_BLUE)),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("ALIGN", (0, 0), (0, -1), "CENTER"),
+            ("ALIGN", (3, 0), (5, -1), "RIGHT"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ]
+    )
+
+    # Split into chunks for pagination with repeated headers
+    ROWS_PER_PAGE = 28
+    for chunk_start in range(0, len(plots), ROWS_PER_PAGE):
+        chunk = plots[chunk_start : chunk_start + ROWS_PER_PAGE]
+        table_data = [inv_header]
+
+        for i, plot in enumerate(chunk, start=chunk_start + 1):
+            status = "Active"
+            if deviations:
+                for dev in deviations:
+                    if dev.get("plot_label") == plot.get("label"):
+                        status = (
+                            dev.get("deviation_type", "Unknown")
+                            .replace("_", " ")
+                            .title()
+                        )
+                        break
+
+            cat_label = CATEGORY_STYLES.get(plot.get("category", "plot"), {}).get(
+                "label", plot.get("category", "plot").replace("_", " ").title()
+            )
+
+            table_data.append(
+                [
+                    str(i),
+                    plot.get("label", f"Plot {i}"),
+                    cat_label,
+                    f"{plot.get('area_sqm', 0):,.1f}",
+                    f"{plot.get('area_sqft', 0):,.1f}",
+                    f"{plot.get('perimeter_m', 0):,.1f}",
+                    status,
+                ]
+            )
+
+        t = Table(table_data, colWidths=col_widths, repeatRows=1)
+        num_rows = len(table_data)
+        style_cmds = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(CSIDC_BLUE)),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#E0E0E0")),
+            (
+                "ROWBACKGROUNDS",
+                (0, 1),
+                (-1, -1),
+                [colors.HexColor("#E3F2FD"), colors.white],
+            ),
+            ("ALIGN", (0, 0), (0, -1), "CENTER"),
+            ("ALIGN", (3, 0), (5, -1), "RIGHT"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ]
+        t.setStyle(TableStyle(style_cmds))
+        elements.append(t)
+
+        # Page break between chunks (but not after the last one)
+        if chunk_start + ROWS_PER_PAGE < len(plots):
+            elements.append(PageBreak())
+
+    # ===================================================================
+    # DEVIATION DETAILS (if available)
+    # ===================================================================
+    if deviations:
+        non_compliant = [
+            d for d in deviations if d.get("deviation_type") != "COMPLIANT"
+        ]
+        if non_compliant:
+            elements.append(PageBreak())
+            elements.append(Paragraph("Deviation Details", s_subtitle))
+            elements.append(Spacer(1, 4))
+            elements.append(
+                Paragraph(
+                    f"{len(non_compliant)} non-compliant deviation(s) detected.",
+                    s_small,
+                )
+            )
+            elements.append(Spacer(1, 10))
+
+            for dev in non_compliant:
+                dev_type = dev.get("deviation_type", "Unknown")
+                dev_color = DEVIATION_COLORS.get(dev_type, "#9ca3af")
+                sev = dev.get("severity", "low")
+
+                # Deviation header
+                elements.append(
+                    Paragraph(
+                        f'<font color="{dev_color}"><b>{dev.get("plot_label", "Unknown")}</b></font>'
+                        f" — {dev_type.replace('_', ' ').title()}"
+                        f' <font color="{CSIDC_GRAY}" size="8">[{sev.upper()}]</font>',
+                        s_section,
+                    )
+                )
+
+                if dev.get("description"):
+                    elements.append(Paragraph(dev["description"], s_body))
+
+                details = dev.get("details", {})
+                if details:
+                    detail_rows = []
+                    if details.get("detected_area_sqm"):
+                        detail_rows.append(
+                            [
+                                "Detected Area",
+                                f"{details['detected_area_sqm']:,.1f} sq.m",
+                            ]
+                        )
+                    if details.get("basemap_area_sqm"):
+                        detail_rows.append(
+                            ["Basemap Area", f"{details['basemap_area_sqm']:,.1f} sq.m"]
+                        )
+                    if details.get("encroachment_area_sqm"):
+                        detail_rows.append(
+                            [
+                                "Encroachment Area",
+                                f"{details['encroachment_area_sqm']:,.1f} sq.m",
+                            ]
+                        )
+                    if details.get("vacant_area_sqm"):
+                        detail_rows.append(
+                            ["Vacant Area", f"{details['vacant_area_sqm']:,.1f} sq.m"]
+                        )
+                    if details.get("match_percentage"):
+                        detail_rows.append(["Match", f"{details['match_percentage']}%"])
+
+                    if detail_rows:
+                        dt = Table(detail_rows, colWidths=[150, 150])
+                        dt.setStyle(
+                            TableStyle(
+                                [
+                                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                                    (
+                                        "GRID",
+                                        (0, 0),
+                                        (-1, -1),
+                                        0.4,
+                                        colors.HexColor("#E0E0E0"),
+                                    ),
+                                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                                    (
+                                        "TEXTCOLOR",
+                                        (0, 0),
+                                        (0, -1),
+                                        colors.HexColor(CSIDC_GRAY),
+                                    ),
+                                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                                ]
+                            )
+                        )
+                        elements.append(dt)
+                elements.append(Spacer(1, 10))
+
+    # ===================================================================
+    # FINAL PAGE: DISCLAIMER / FOOTER
+    # ===================================================================
+    elements.append(Spacer(1, 30))
+
+    # Orange line
+    end_line = Table([[""]], colWidths=[page_w - 40 * mm], rowHeights=[2])
+    end_line.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(CSIDC_BLUE)),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+    elements.append(end_line)
+    elements.append(Spacer(1, 8))
+
+    elements.append(
+        Paragraph(
+            "<b>Disclaimer:</b> This report was generated by <b>Drishti — Automated Land Monitoring System</b> "
+            "for the Chhattisgarh State Industrial Development Corporation (CSIDC). "
+            "Data accuracy depends on satellite imagery resolution and AI model predictions. "
+            "This report is intended for internal assessment purposes only and should not be used "
+            "as a legal survey document.",
             ParagraphStyle(
-                "Footer", parent=styles["Normal"], fontSize=8, textColor=colors.grey
+                "Disclaimer",
+                parent=styles["Normal"],
+                fontSize=8,
+                textColor=colors.HexColor(CSIDC_GRAY),
+                leading=11,
+                spaceBefore=4,
             ),
         )
     )
 
-    doc.build(elements)
+    # Build with header/footer
+    doc.build(elements, onFirstPage=_page_template, onLaterPages=_page_template)
 
-    # Cleanup temp schematic
-    try:
-        schematic_path.unlink()
-    except OSError:
-        pass
+    # Cleanup temp images
+    for pattern in [
+        f"schematic_{timestamp}.png",
+        f"satellite_{timestamp}.png",
+        f"csidc_ref_{timestamp}.png",
+        f"combined_{timestamp}.png",
+        f"ref_schematic_{timestamp}.png",
+        f"pie_{timestamp}.png",
+        f"detail_{timestamp}_*.png",
+    ]:
+        for temp in settings.EXPORTS_DIR.glob(pattern):
+            try:
+                temp.unlink()
+            except OSError:
+                pass
 
     logger.info(f"PDF report generated: {output_path}")
     return output_path

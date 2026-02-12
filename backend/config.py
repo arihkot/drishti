@@ -30,6 +30,7 @@ class Settings(BaseSettings):
 
     # CSIDC Layer Names
     LAYER_INDUSTRIAL_PLOTS: str = "csidc_industrial_area_with_plots"
+    LAYER_INDUSTRIAL_PLOTS_OLD: str = "cg_industrial_area_with_plot_info"
     LAYER_INDUSTRIAL_BOUNDARY: str = "csidc_industrial_area_outer_boundary"
     LAYER_OLD_INDUSTRIAL: str = "csidc_old_IA"
     LAYER_OLD_INDUSTRIAL_BOUNDARY: str = "csidc_old_IA_outer_b"
@@ -55,7 +56,7 @@ class Settings(BaseSettings):
     SAM_DEVICE: str = "mps"  # Apple Silicon GPU; MPS fallback handles unsupported ops
 
     # Detection
-    MIN_POLYGON_AREA_SQM: float = 10.0
+    MIN_POLYGON_AREA_SQM: float = 50.0  # Raised from 10; industrial plots are 200+ sqm
     SIMPLIFY_TOLERANCE: float = 3.0  # ~3.3m in degrees; smooths pixel staircase
     ENCROACHMENT_TOLERANCE_M: float = 2.0
 

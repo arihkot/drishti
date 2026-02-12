@@ -1,18 +1,99 @@
 """Areas router - CSIDC area listing and basemap proxy."""
 
+import hashlib
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.config import settings
 from backend.database import get_db
-from backend.models import BasemapCache, CsidcReferencePlot
+from backend.models import BasemapCache, CsidcReferencePlot, WmsTileCache
 from backend.services.csidc_client import csidc_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+async def _ensure_areas_cached(
+    db: AsyncSession,
+    category: str | None = None,
+    force_refresh: bool = False,
+) -> list[BasemapCache]:
+    """Ensure area boundaries are stored in the local DB.
+
+    On the very first call (or when ``force_refresh=True``), fetches all
+    areas from CSIDC and bulk-inserts them into ``basemap_cache``. Every
+    subsequent call just reads from the DB — no network requests.
+
+    Returns the list of ``BasemapCache`` rows matching *category* (or all
+    categories if *category* is ``None``).
+    """
+    categories_to_check = (
+        [category] if category else ["industrial", "old_industrial", "directorate"]
+    )
+
+    # Check which categories still need fetching
+    categories_to_fetch: list[str] = []
+    for cat in categories_to_check:
+        if force_refresh:
+            categories_to_fetch.append(cat)
+            continue
+        result = await db.execute(
+            select(BasemapCache).where(BasemapCache.layer_name == cat).limit(1)
+        )
+        if not result.scalar_one_or_none():
+            categories_to_fetch.append(cat)
+
+    # Fetch missing categories from CSIDC and store
+    if categories_to_fetch:
+        for cat in categories_to_fetch:
+            try:
+                if cat == "industrial":
+                    areas = await csidc_client.get_industrial_areas()
+                elif cat == "old_industrial":
+                    areas = await csidc_client.get_old_industrial_areas()
+                elif cat == "directorate":
+                    areas = await csidc_client.get_directorate_areas()
+                else:
+                    continue
+
+                if force_refresh:
+                    # Delete old entries for this category before re-inserting
+                    from sqlalchemy import delete
+
+                    await db.execute(
+                        delete(BasemapCache).where(BasemapCache.layer_name == cat)
+                    )
+
+                for area in areas:
+                    if not area.get("geometry"):
+                        continue
+                    cache_entry = BasemapCache(
+                        layer_name=cat,
+                        area_name=area["name"],
+                        geometry_json=json.dumps(area["geometry"]),
+                        properties_json=json.dumps(area.get("properties", {})),
+                    )
+                    db.add(cache_entry)
+
+                await db.flush()
+                logger.info(
+                    f"Cached {len(areas)} areas for category '{cat}' from CSIDC"
+                )
+            except Exception as e:
+                logger.error(f"Failed to fetch {cat} areas from CSIDC: {e}")
+
+    # Return cached entries
+    query = select(BasemapCache)
+    if category:
+        query = query.where(BasemapCache.layer_name == category)
+    result = await db.execute(query)
+    return list(result.scalars().all())
 
 
 @router.get("")
@@ -20,60 +101,33 @@ async def list_areas(
     category: str = Query(
         None, description="Filter: industrial, old_industrial, directorate"
     ),
+    refresh: bool = Query(False, description="Force re-fetch from CSIDC"),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all available industrial areas from CSIDC."""
+    """List all available industrial areas.
+
+    Serves from local DB cache. On first call, fetches from CSIDC and
+    stores locally. Pass ``?refresh=true`` to force a re-fetch.
+    """
     try:
-        areas = []
+        cached_areas = await _ensure_areas_cached(db, category, force_refresh=refresh)
 
-        if category is None or category == "industrial":
-            industrial = await csidc_client.get_industrial_areas()
-            areas.extend(industrial)
-
-        if category is None or category == "old_industrial":
-            old_industrial = await csidc_client.get_old_industrial_areas()
-            areas.extend(old_industrial)
-
-        if category is None or category == "directorate":
-            directorate = await csidc_client.get_directorate_areas()
-            areas.extend(directorate)
-
-        # Cache boundaries in DB
-        for area in areas:
-            if area.get("geometry"):
-                existing = await db.execute(
-                    select(BasemapCache).where(
-                        BasemapCache.area_name == area["name"],
-                        BasemapCache.layer_name == area["category"],
-                    )
-                )
-                if not existing.scalar_one_or_none():
-                    cache_entry = BasemapCache(
-                        layer_name=area["category"],
-                        area_name=area["name"],
-                        geometry_json=json.dumps(area["geometry"]),
-                        properties_json=json.dumps(area.get("properties", {})),
-                    )
-                    db.add(cache_entry)
-
-        # Return without heavy geometry for listing
         return {
             "areas": [
                 {
-                    "name": a["name"],
-                    "category": a["category"],
-                    "has_geometry": bool(a.get("geometry")),
+                    "name": e.area_name,
+                    "category": e.layer_name,
+                    "has_geometry": True,
                 }
-                for a in areas
+                for e in cached_areas
             ],
-            "total": len(areas),
+            "total": len(cached_areas),
+            "source": "cache",
         }
 
     except Exception as e:
-        logger.error(f"Failed to fetch areas: {e}")
-        raise HTTPException(
-            status_code=502, detail=f"Failed to fetch from CSIDC: {str(e)}"
-        )
+        logger.error(f"Failed to list areas: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch areas: {str(e)}")
 
 
 @router.get("/cached")
@@ -101,7 +155,11 @@ async def get_area_boundary(
     category: str = Query("industrial"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get boundary GeoJSON for a specific area."""
+    """Get boundary GeoJSON for a specific area.
+
+    Checks local cache first. On miss, fetches ALL areas for that
+    category from CSIDC (so future boundary lookups are instant too).
+    """
     # Check cache first
     result = await db.execute(
         select(BasemapCache).where(
@@ -119,32 +177,18 @@ async def get_area_boundary(
             "properties": cached.properties,
         }
 
-    # Fetch from CSIDC
+    # Cache miss — fetch the entire category so all areas are cached at once
     try:
-        if category == "industrial":
-            areas = await csidc_client.get_industrial_areas()
-        elif category == "old_industrial":
-            areas = await csidc_client.get_old_industrial_areas()
-        elif category == "directorate":
-            areas = await csidc_client.get_directorate_areas()
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown category: {category}")
+        all_cached = await _ensure_areas_cached(db, category)
 
-        for area in areas:
-            if area["name"] == area_name:
-                # Cache it
-                cache_entry = BasemapCache(
-                    layer_name=category,
-                    area_name=area_name,
-                    geometry_json=json.dumps(area["geometry"]),
-                    properties_json=json.dumps(area.get("properties", {})),
-                )
-                db.add(cache_entry)
+        # Find the requested area in the freshly-cached list
+        for entry in all_cached:
+            if entry.area_name == area_name:
                 return {
-                    "name": area_name,
-                    "category": category,
-                    "geometry": area["geometry"],
-                    "properties": area.get("properties", {}),
+                    "name": entry.area_name,
+                    "category": entry.layer_name,
+                    "geometry": entry.geometry,
+                    "properties": entry.properties,
                 }
 
         raise HTTPException(status_code=404, detail=f"Area '{area_name}' not found")
@@ -216,7 +260,20 @@ async def get_reference_plots(
 
     # Fetch from CSIDC and cache
     try:
-        plots = await csidc_client.get_individual_plots(area_name)
+        # Get the boundary geometry for spatial fallback
+        boundary_geom = None
+        bm_result = await db.execute(
+            select(BasemapCache).where(
+                BasemapCache.area_name == area_name,
+            )
+        )
+        bm_entry = bm_result.scalars().first()
+        if bm_entry and bm_entry.geometry:
+            boundary_geom = bm_entry.geometry
+
+        plots = await csidc_client.get_individual_plots(
+            area_name, boundary_geometry=boundary_geom
+        )
 
         if not plots:
             return {
@@ -258,6 +315,90 @@ async def get_reference_plots(
             status_code=502,
             detail=f"Failed to fetch reference plots from CSIDC: {str(e)}",
         )
+
+
+@router.get("/wms-proxy")
+async def wms_proxy(request: Request, db: AsyncSession = Depends(get_db)):
+    """Proxy WMS requests to CSIDC GeoServer with local DB tile caching.
+
+    Forwards all query params to the CSIDC WMS endpoint, adds auth token,
+    and returns the response (typically a PNG image). This solves CORS/auth
+    issues when the browser tries to load WMS tiles directly.
+
+    Tiles are cached in SQLite by a SHA-256 hash of the canonical query params
+    so subsequent identical requests are served from local DB instantly.
+    """
+    params = dict(request.query_params)
+    if not params:
+        raise HTTPException(status_code=400, detail="No WMS params provided")
+
+    # Build a deterministic cache key from sorted query params
+    canonical = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    cache_key = hashlib.sha256(canonical.encode()).hexdigest()
+
+    # Check DB cache first
+    result = await db.execute(
+        select(WmsTileCache).where(WmsTileCache.cache_key == cache_key)
+    )
+    cached = result.scalar_one_or_none()
+
+    if cached:
+        return Response(
+            content=cached.tile_data,
+            media_type=cached.content_type,
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                "Access-Control-Allow-Origin": "*",
+                "X-Cache": "HIT",
+            },
+        )
+
+    # Cache miss — fetch from CSIDC
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0), verify=False
+        ) as client:
+            resp = await client.get(
+                settings.CSIDC_WMS_URL,
+                params=params,
+                headers={"Authorization": settings.CSIDC_AUTH_TOKEN},
+            )
+            resp.raise_for_status()
+
+            content_type = resp.headers.get("content-type", "image/png")
+            tile_data = resp.content
+
+            # Store in DB cache
+            entry = WmsTileCache(
+                cache_key=cache_key,
+                content_type=content_type,
+                tile_data=tile_data,
+            )
+            db.add(entry)
+            # Flush so it's persisted (session auto-commits via middleware)
+            await db.flush()
+
+            logger.info(
+                f"WMS tile cached: {cache_key[:12]}... ({len(tile_data)} bytes)"
+            )
+
+            return Response(
+                content=tile_data,
+                media_type=content_type,
+                headers={
+                    "Cache-Control": "public, max-age=86400",
+                    "Access-Control-Allow-Origin": "*",
+                    "X-Cache": "MISS",
+                },
+            )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"WMS proxy error: {e.response.status_code}")
+        raise HTTPException(
+            status_code=e.response.status_code, detail="WMS request failed"
+        )
+    except Exception as e:
+        logger.error(f"WMS proxy error: {e}")
+        raise HTTPException(status_code=502, detail=f"WMS proxy failed: {str(e)}")
 
 
 @router.get("/districts")

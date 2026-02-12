@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
-from backend.models import Plot, Project
+from backend.models import Plot, Project, CsidcReferencePlot
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -23,7 +23,7 @@ class AutoDetectRequest(BaseModel):
     project_name: str | None = None
     area_name: str | None = None
     area_category: str | None = None
-    min_area_sqm: float = 10.0
+    min_area_sqm: float = 50.0
 
 
 class PromptDetectRequest(BaseModel):
@@ -43,57 +43,34 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
     """
     try:
         from backend.services.tile_fetcher import fetch_satellite_image
-        from backend.services.sam_detector import detect_boundaries_auto
+        from backend.services.sam_detector import (
+            detect_boundaries_auto,
+            detect_boundaries_csidc_guided,
+        )
         from backend.services.vectorizer import (
             process_masks_to_plots,
             merge_overlapping_polygons,
+            remove_contained_polygons,
             clip_to_boundary,
+            renumber_labels,
         )
 
         t_start = time.time()
 
-        # 1. Fetch satellite imagery
-        logger.info(f"Fetching satellite imagery for bbox: {data.bbox}")
-        image, meta = await fetch_satellite_image(data.bbox, data.zoom)
-        t_fetch = time.time()
-        logger.info(
-            f"[TIMING] Tile fetch: {t_fetch - t_start:.2f}s | Image: {image.shape}"
-        )
+        # ── PHASE 0: Import CSIDC reference data BEFORE detection ──
+        # Fetch boundary + reference plots first so we can use them
+        # to guide SAM and fill in any plots SAM misses.
+        boundary_geom = None
+        csidc_plots: list[dict] = []
 
-        # 2. Run SAM detection
-        logger.info("Running SAM auto-detection...")
-        raw_masks = await detect_boundaries_auto(image, meta)
-        t_sam = time.time()
-        logger.info(
-            f"[TIMING] SAM detection: {t_sam - t_fetch:.2f}s | Raw masks: {len(raw_masks)}"
-        )
-
-        # 3. Process masks into plots (pass satellite image for color-based classification)
-        plots_data = process_masks_to_plots(
-            raw_masks, min_area_sqm=data.min_area_sqm, image=image, meta=meta
-        )
-        t_process = time.time()
-        logger.info(
-            f"[TIMING] Vectorization: {t_process - t_sam:.2f}s | Plots: {len(plots_data)}"
-        )
-
-        # 4. Merge overlapping
-        plots_data = merge_overlapping_polygons(plots_data)
-        t_merge = time.time()
-        logger.info(
-            f"[TIMING] Merge: {t_merge - t_process:.2f}s | After merge: {len(plots_data)}"
-        )
-
-        # 4b. Clip to area boundary if area_name provided
         if data.area_name:
+            # 0a. Fetch area boundary (from local DB, or fetch+cache from CSIDC)
             try:
                 from backend.models import BasemapCache
+                from backend.routers.areas import _ensure_areas_cached
 
-                t_clip_start = time.time()
                 category = data.area_category or "industrial"
-                boundary_geom = None
 
-                # Check local DB cache first
                 cached = await db.execute(
                     select(BasemapCache).where(
                         BasemapCache.area_name == data.area_name,
@@ -106,44 +83,182 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
                     boundary_geom = cached_entry.geometry
                     logger.info(f"Using cached boundary for {data.area_name}")
                 else:
-                    # Fall back to CSIDC API and cache the result
-                    from backend.services.csidc_client import csidc_client
-
-                    if category == "industrial":
-                        all_areas = await csidc_client.get_industrial_areas()
-                    elif category == "old_industrial":
-                        all_areas = await csidc_client.get_old_industrial_areas()
-                    elif category == "directorate":
-                        all_areas = await csidc_client.get_directorate_areas()
-                    else:
-                        all_areas = []
-
-                    for area in all_areas:
-                        if area["name"] == data.area_name and area.get("geometry"):
-                            boundary_geom = area["geometry"]
-                            # Cache for future use
-                            cache_entry = BasemapCache(
-                                layer_name=category,
-                                area_name=data.area_name,
-                                geometry_json=json.dumps(boundary_geom),
-                                properties_json=json.dumps(area.get("properties", {})),
-                            )
-                            db.add(cache_entry)
+                    # Fetch all areas for this category and cache them
+                    all_cached = await _ensure_areas_cached(db, category)
+                    for entry in all_cached:
+                        if entry.area_name == data.area_name and entry.geometry:
+                            boundary_geom = entry.geometry
                             logger.info(
                                 f"Fetched & cached boundary for {data.area_name}"
                             )
                             break
+            except Exception as e:
+                logger.warning(f"Failed to fetch area boundary: {e}")
 
-                if boundary_geom:
-                    plots_data = clip_to_boundary(plots_data, boundary_geom)
-                    logger.info(
-                        f"[TIMING] Boundary clip: {time.time() - t_clip_start:.2f}s | "
-                        f"Clipped to {data.area_name}: {len(plots_data)} plots"
+            # 0b. Fetch CSIDC reference plots (from cache or API)
+            try:
+                from backend.services.csidc_client import csidc_client
+                from backend.models import CsidcReferencePlot
+
+                cached_ref = await db.execute(
+                    select(CsidcReferencePlot).where(
+                        CsidcReferencePlot.area_name == data.area_name,
                     )
+                )
+                cached_ref_plots = cached_ref.scalars().all()
+
+                if cached_ref_plots:
+                    csidc_plots = [
+                        {"geometry": p.geometry, "name": p.plot_name}
+                        for p in cached_ref_plots
+                    ]
+                    logger.info(
+                        f"Loaded {len(csidc_plots)} cached CSIDC ref plots BEFORE detection"
+                    )
+                else:
+                    csidc_plots_raw = await csidc_client.get_individual_plots(
+                        data.area_name,
+                        boundary_geometry=boundary_geom,
+                    )
+                    csidc_plots = csidc_plots_raw
+
+                    for plot in csidc_plots_raw:
+                        entry = CsidcReferencePlot(
+                            area_name=data.area_name,
+                            plot_name=plot.get("name"),
+                            geometry_json=json.dumps(plot["geometry"]),
+                            properties_json=json.dumps(plot.get("properties", {})),
+                        )
+                        db.add(entry)
+                    if csidc_plots_raw:
+                        await db.flush()
+                    logger.info(
+                        f"Fetched & cached {len(csidc_plots)} CSIDC ref plots BEFORE detection"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to fetch CSIDC reference plots: {e}")
+
+        t_preload = time.time()
+        logger.info(
+            f"[TIMING] CSIDC preload: {t_preload - t_start:.2f}s | "
+            f"boundary={'yes' if boundary_geom else 'no'}, ref_plots={len(csidc_plots)}"
+        )
+
+        # ── PHASE 1: Fetch satellite imagery ──
+        logger.info(f"Fetching satellite imagery for bbox: {data.bbox}")
+        image, meta = await fetch_satellite_image(data.bbox, data.zoom)
+        t_fetch = time.time()
+        logger.info(
+            f"[TIMING] Tile fetch: {t_fetch - t_preload:.2f}s | Image: {image.shape}"
+        )
+
+        # ── PHASE 2: Run SAM auto-detection ──
+        logger.info("Running SAM auto-detection...")
+        raw_masks = await detect_boundaries_auto(image, meta)
+        t_sam = time.time()
+        logger.info(
+            f"[TIMING] SAM detection: {t_sam - t_fetch:.2f}s | Raw masks: {len(raw_masks)}"
+        )
+
+        # ── PHASE 2b: CSIDC-guided detection for missed plots ──
+        csidc_guided_count = 0
+        if csidc_plots:
+            try:
+                t_csidc_start = time.time()
+                extra_masks = await detect_boundaries_csidc_guided(
+                    image, meta, raw_masks, csidc_plots
+                )
+                csidc_guided_count = len(extra_masks)
+                raw_masks.extend(extra_masks)
+                logger.info(
+                    f"[TIMING] CSIDC-guided pass: {time.time() - t_csidc_start:.2f}s | "
+                    f"Extra masks: {csidc_guided_count}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"CSIDC-guided detection failed, continuing with auto only: {e}"
+                )
+
+        # ── PHASE 3: Process masks into plots ──
+        plots_data = process_masks_to_plots(
+            raw_masks, min_area_sqm=data.min_area_sqm, image=image, meta=meta
+        )
+        t_process = time.time()
+        logger.info(
+            f"[TIMING] Vectorization: {t_process - t_sam:.2f}s | Plots: {len(plots_data)}"
+        )
+
+        # ── PHASE 3b: Inject CSIDC reference plots that SAM missed entirely ──
+        # After processing masks, check which CSIDC plots are still undetected
+        # and inject their geometries directly as detected plots.
+        if csidc_plots:
+            try:
+                from backend.services.vectorizer import inject_missing_csidc_plots
+
+                injected_count_before = len(plots_data)
+                plots_data = inject_missing_csidc_plots(
+                    plots_data, csidc_plots, image=image, meta=meta
+                )
+                injected = len(plots_data) - injected_count_before
+                logger.info(
+                    f"Injected {injected} CSIDC reference plots that SAM missed entirely"
+                )
+            except Exception as e:
+                logger.warning(f"CSIDC injection failed: {e}")
+
+        # ── PHASE 4: Post-processing ──
+        # 4a. Merge overlapping polygons
+        plots_data = merge_overlapping_polygons(plots_data)
+        t_merge = time.time()
+        logger.info(
+            f"[TIMING] Merge: {t_merge - t_process:.2f}s | After merge: {len(plots_data)}"
+        )
+
+        # 4b. Merge small nearby polygons that should be one plot
+        from backend.services.vectorizer import merge_small_nearby_polygons
+
+        plots_data = merge_small_nearby_polygons(plots_data)
+        logger.info(f"After small-nearby merge: {len(plots_data)} plots")
+
+        # 4c. Area-based noise filter: drop tiny road fragments that are
+        # almost always SAM noise (shadows, road markings, tiny slivers).
+        # Plots are kept regardless of size (MIN_POLYGON_AREA_SQM handles that).
+        NOISE_AREA_THRESHOLD_SQM = 100.0
+        before_noise = len(plots_data)
+        plots_data = [
+            p
+            for p in plots_data
+            if not (
+                p.get("category") == "road"
+                and p.get("area_sqm", 0) < NOISE_AREA_THRESHOLD_SQM
+            )
+        ]
+        noise_dropped = before_noise - len(plots_data)
+        if noise_dropped:
+            logger.info(
+                f"Noise filter: dropped {noise_dropped} tiny features "
+                f"(<{NOISE_AREA_THRESHOLD_SQM} sqm), {len(plots_data)} remaining"
+            )
+
+        # 4d. Remove smaller polygons contained inside larger ones
+        plots_data = remove_contained_polygons(plots_data)
+
+        # 4e. Clip to area boundary
+        if boundary_geom:
+            try:
+                t_clip_start = time.time()
+                plots_data = clip_to_boundary(plots_data, boundary_geom)
+                logger.info(
+                    f"[TIMING] Boundary clip: {time.time() - t_clip_start:.2f}s | "
+                    f"Clipped to {data.area_name}: {len(plots_data)} plots"
+                )
             except Exception as e:
                 logger.warning(f"Boundary clip failed, keeping all plots: {e}")
 
-        # 5. Create or get project
+        # 5. Re-number labels sequentially (merge/clip may have removed some)
+        plots_data = renumber_labels(plots_data)
+
+        # 6. Create or get project
         if data.project_id:
             result = await db.execute(
                 select(Project).where(Project.id == data.project_id)
@@ -151,6 +266,18 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
             project = result.scalar_one_or_none()
             if not project:
                 raise HTTPException(status_code=404, detail="Project not found")
+
+            # Clear existing plots before saving new detection results
+            from sqlalchemy import delete
+
+            await db.execute(delete(Plot).where(Plot.project_id == project.id))
+            logger.info(f"Cleared existing plots for project {project.id}")
+
+            # Update project bbox/zoom in case they changed
+            project.bbox_json = json.dumps(data.bbox)
+            project.center_lon = (data.bbox[0] + data.bbox[2]) / 2
+            project.center_lat = (data.bbox[1] + data.bbox[3]) / 2
+            project.zoom = data.zoom
         else:
             project = Project(
                 name=data.project_name or f"Detection {data.bbox}",
@@ -165,7 +292,7 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
             await db.flush()
             await db.refresh(project)
 
-        # 6. Save plots to DB
+        # 7. Save plots to DB
         saved_plots = []
         for plot_data in plots_data:
             plot = Plot(
@@ -213,6 +340,7 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
                 "bbox": meta["bbox"],
                 "zoom": meta["zoom"],
                 "tiles": f"{meta['tiles_x']}x{meta['tiles_y']}",
+                "csidc_guided_extra": csidc_guided_count,
             },
             "timing_seconds": round(time.time() - t_start, 2),
         }
@@ -348,3 +476,21 @@ async def preload_model():
         return {"status": "loaded", "model_type": f"SAM ({settings.SAM_MODEL_TYPE})"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
+
+
+@router.post("/reload-model")
+async def reload_model():
+    """Force reload SAM model (use after changing parameters)."""
+    try:
+        from backend.services.sam_detector import reload_models, get_sam_model
+
+        reload_models()
+        model = get_sam_model()
+        from backend.config import settings
+
+        return {
+            "status": "reloaded",
+            "model_type": f"SAM ({settings.SAM_MODEL_TYPE})",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reload model: {str(e)}")

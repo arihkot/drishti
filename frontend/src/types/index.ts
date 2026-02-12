@@ -150,10 +150,4 @@ export type DeviationType =
 
 export type Severity = "low" | "medium" | "high" | "critical";
 
-export type PlotCategory = "plot" | "road" | "vegetation" | "open_land" | "water" | "building" | "infrastructure" | "other";
-
-export interface CsidcReferencePlot {
-  name: string;
-  geometry: GeoJSONGeometry;
-  properties: Record<string, unknown>;
-}
+export type PlotCategory = "plot" | "road" | "open_land" | "building" | "infrastructure" | "other";

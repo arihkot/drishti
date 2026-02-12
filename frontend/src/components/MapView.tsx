@@ -1,16 +1,20 @@
-import React, { useRef, useEffect, useCallback } from "react";
+import React, { useRef, useEffect, useCallback, useState } from "react";
 import Map from "ol/Map";
 import View from "ol/View";
+import Overlay from "ol/Overlay";
 import TileLayer from "ol/layer/Tile";
 import XYZ from "ol/source/XYZ";
+import TileWMS from "ol/source/TileWMS";
 import ImageLayer from "ol/layer/Image";
 import ImageWMS from "ol/source/ImageWMS";
 import VectorLayer from "ol/layer/Vector";
 import VectorSource from "ol/source/Vector";
 import GeoJSON from "ol/format/GeoJSON";
-import { Style, Fill, Stroke, Text as OlText } from "ol/style";
+import { Style, Fill, Stroke, Text as OlText, Circle as CircleStyle } from "ol/style";
 import { useGeographic } from "ol/proj";
 import Feature from "ol/Feature";
+import { Modify } from "ol/interaction";
+import { Collection } from "ol";
 import type { MapBrowserEvent } from "ol";
 import type { Geometry } from "ol/geom";
 
@@ -39,16 +43,11 @@ function schematicStyle(category: string, label: string): Style {
   const base: Record<string, { fill: string; stroke: string }> = {
     plot: { fill: "rgba(239,68,68,0.15)", stroke: "#ef4444" },
     road: { fill: "rgba(100,116,139,0.10)", stroke: "#64748b" },
-    vegetation: { fill: "rgba(34,197,94,0.15)", stroke: "#22c55e" },
-    open_land: { fill: "rgba(217,119,6,0.15)", stroke: "#d97706" },
-    water: { fill: "rgba(59,130,246,0.20)", stroke: "#3b82f6" },
-    building: { fill: "rgba(168,85,247,0.15)", stroke: "#a855f7" },
-    infrastructure: { fill: "rgba(245,158,11,0.15)", stroke: "#f59e0b" },
-    other: { fill: "rgba(156,163,175,0.15)", stroke: "#9ca3af" },
+    boundary: { fill: "rgba(249,115,22,0.08)", stroke: "#f97316" },
     // Legacy support
     parcel: { fill: "rgba(239,68,68,0.15)", stroke: "#ef4444" },
   };
-  const cfg = base[category] ?? base.other;
+  const cfg = base[category] ?? base.plot;
 
   return new Style({
     fill: new Fill({ color: cfg.fill }),
@@ -85,10 +84,23 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   // Layer refs so we can update them without recreating the map
   const baseTileRef = useRef<TileLayer<XYZ> | null>(null);
   const wmsLayerRef = useRef<ImageLayer<ImageWMS> | null>(null);
-  const csidcRefLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
+  const csidcRefLayerRef = useRef<TileLayer<TileWMS> | null>(null);
   const boundaryLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
   const plotLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
   const deviationLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
+
+  // Modify interaction ref for boundary editing
+  const modifyRef = useRef<Modify | null>(null);
+  const editCollectionRef = useRef<Collection<Feature<Geometry>> | null>(null);
+
+  // Hover popup refs
+  const popupRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<Overlay | null>(null);
+  const [hoverInfo, setHoverInfo] = useState<{
+    label: string;
+    category: string;
+    color: string;
+  } | null>(null);
 
   // Store slices
   const viewMode = useStore((s) => s.viewMode);
@@ -99,11 +111,17 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   const selectedArea = useStore((s) => s.selectedArea);
   const setAreaBoundary = useStore((s) => s.setAreaBoundary);
   const showCsidcReference = useStore((s) => s.showCsidcReference);
-  const csidcReferencePlots = useStore((s) => s.csidcReferencePlots);
+  const hideDetectedPlots = useStore((s) => s.hideDetectedPlots);
   const comparison = useStore((s) => s.comparison);
   const runPromptDetect = useStore((s) => s.runPromptDetect);
   const loadWMSConfig = useStore((s) => s.loadWMSConfig);
   const setMapView = useStore((s) => s.setMapView);
+
+  // Editing state
+  const editingPlotId = useStore((s) => s.editingPlotId);
+  const updateEditingGeometry = useStore((s) => s.updateEditingGeometry);
+  const cancelEditing = useStore((s) => s.cancelEditing);
+  const saveEditing = useStore((s) => s.saveEditing);
 
   // -------------------------------------------------------------------
   // 1. Initialize the map (once)
@@ -136,14 +154,23 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       }),
     });
 
-    const csidcRefSource = new VectorSource<Feature<Geometry>>();
-    const csidcRefLayer = new VectorLayer({
+    const csidcRefSource = new TileWMS({
+      url: "/api/areas/wms-proxy",
+      params: {
+        LAYERS: "CGCOG_DATABASE:csidc_industrial_area_with_plots",
+        FORMAT: "image/png",
+        TRANSPARENT: true,
+        SRS: "EPSG:4326",
+        VERSION: "1.1.1",
+        SERVICE: "WMS",
+        REQUEST: "GetMap",
+      },
+      serverType: "geoserver",
+    });
+    const csidcRefLayer = new TileLayer({
       source: csidcRefSource,
       visible: false,
-      style: new Style({
-        fill: new Fill({ color: "rgba(251, 191, 36, 0.12)" }),
-        stroke: new Stroke({ color: "#f59e0b", width: 1.5 }),
-      }),
+      opacity: 0.55,
     });
 
     const deviationSource = new VectorSource<Feature<Geometry>>();
@@ -222,52 +249,32 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   }, [wmsConfig]);
 
   // -------------------------------------------------------------------
-  // 2b. Populate CSIDC reference vector layer from cached data
+  // 2b. Update CSIDC ref WMS layer extent when project bbox changes
   // -------------------------------------------------------------------
   useEffect(() => {
     const layer = csidcRefLayerRef.current;
     if (!layer) return;
 
-    const source = layer.getSource();
-    if (!source) return;
-    source.clear();
-
-    if (csidcReferencePlots.length === 0) {
-      layer.setVisible(false);
-      return;
+    const bbox = activeProject?.bbox;
+    if (bbox && bbox.length === 4) {
+      // Clip the WMS layer to the detected project extent
+      layer.setExtent(bbox as [number, number, number, number]);
+    } else {
+      // No project bbox — don't clip, but layer won't show (no detection run yet)
+      layer.setExtent(undefined);
     }
-
-    const geojsonFormat = new GeoJSON();
-    for (const plot of csidcReferencePlots) {
-      if (!plot.geometry) continue;
-      try {
-        const feature = geojsonFormat.readFeature(
-          {
-            type: "Feature",
-            geometry: plot.geometry,
-            properties: { name: plot.name, ...plot.properties },
-          },
-          { dataProjection: "EPSG:4326", featureProjection: "EPSG:4326" }
-        ) as Feature<Geometry>;
-        source.addFeature(feature);
-      } catch {
-        // Skip invalid geometry
-      }
-    }
-
-    layer.setVisible(showCsidcReference);
-  }, [csidcReferencePlots, showCsidcReference]);
+  }, [activeProject?.bbox]);
 
   // -------------------------------------------------------------------
   // 2c. Toggle CSIDC reference layer visibility
   // -------------------------------------------------------------------
   useEffect(() => {
     if (csidcRefLayerRef.current) {
-      csidcRefLayerRef.current.setVisible(
-        showCsidcReference && csidcReferencePlots.length > 0
-      );
+      // Only show when toggle is on AND there is a detected extent to clip to
+      const hasBbox = activeProject?.bbox && activeProject.bbox.length === 4;
+      csidcRefLayerRef.current.setVisible(showCsidcReference && !!hasBbox);
     }
-  }, [showCsidcReference, csidcReferencePlots]);
+  }, [showCsidcReference, activeProject?.bbox]);
 
   // -------------------------------------------------------------------
   // 3. Render plots as vector features
@@ -308,7 +315,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   }, [activeProject?.plots]);
 
   // -------------------------------------------------------------------
-  // 4. Style plots — reacts to selectedPlotId and viewMode changes
+  // 4. Style plots — reacts to selectedPlotId, viewMode, and editingPlotId
   // -------------------------------------------------------------------
   useEffect(() => {
     const layer = plotLayerRef.current;
@@ -318,37 +325,95 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       const props = feature.getProperties();
       const id = feature.getId();
       const isSelected = id === selectedPlotId;
+      const isEditing = id === editingPlotId;
+      const inEditMode = editingPlotId !== null;
       const color: string = props.color ?? "#3b82f6";
       const label: string = props.label ?? "";
-      const category: string = props.category ?? "other";
+      const category: string = props.category ?? "plot";
+
+      // Special style for the feature being edited
+      if (isEditing) {
+        return [
+          new Style({
+            fill: new Fill({ color: "rgba(0, 200, 255, 0.15)" }),
+            stroke: new Stroke({
+              color: "#00c8ff",
+              width: 3,
+              lineDash: [8, 4],
+            }),
+            text: label
+              ? new OlText({
+                  text: `${label} (editing)`,
+                  font: "bold 12px sans-serif",
+                  fill: new Fill({ color: "#00c8ff" }),
+                  stroke: new Stroke({ color: "#000000", width: 3 }),
+                  overflow: true,
+                })
+              : undefined,
+          }),
+          // Vertex circles
+          new Style({
+            image: new CircleStyle({
+              radius: 5,
+              fill: new Fill({ color: "#00c8ff" }),
+              stroke: new Stroke({ color: "#ffffff", width: 2 }),
+            }),
+          }),
+        ];
+      }
+
+      // Dim non-editing features when in edit mode
+      const dimFactor = inEditMode ? 0.35 : 1;
 
       if (viewMode === "schematic") {
         const style = schematicStyle(category, label);
-        if (isSelected) {
+        if (isSelected && !inEditMode) {
           style.getStroke()?.setWidth(4);
+        }
+        if (inEditMode) {
+          style.getStroke()?.setColor(`rgba(128,128,128,${dimFactor})`);
+          style.getFill()?.setColor(`rgba(200,200,200,0.08)`);
         }
         return style;
       }
 
       // Satellite mode
       return new Style({
-        fill: new Fill({ color: hexToRgba(color, 0.3) }),
+        fill: new Fill({
+          color: inEditMode
+            ? `rgba(128,128,128,0.1)`
+            : hexToRgba(color, 0.3),
+        }),
         stroke: new Stroke({
-          color,
-          width: isSelected ? 4 : 2,
+          color: inEditMode ? `rgba(128,128,128,${dimFactor})` : color,
+          width: isSelected && !inEditMode ? 4 : 2,
         }),
         text: label
           ? new OlText({
               text: label,
               font: "11px sans-serif",
-              fill: new Fill({ color: "#ffffff" }),
-              stroke: new Stroke({ color: "#000000", width: 2 }),
+              fill: new Fill({
+                color: inEditMode ? `rgba(255,255,255,${dimFactor})` : "#ffffff",
+              }),
+              stroke: new Stroke({
+                color: inEditMode ? `rgba(0,0,0,${dimFactor})` : "#000000",
+                width: 2,
+              }),
               overflow: true,
             })
           : undefined,
       });
     });
-  }, [selectedPlotId, viewMode]);
+  }, [selectedPlotId, viewMode, editingPlotId]);
+
+  // -------------------------------------------------------------------
+  // 4b. Toggle plot layer visibility (CSIDC Only mode)
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    if (plotLayerRef.current) {
+      plotLayerRef.current.setVisible(!hideDetectedPlots);
+    }
+  }, [hideDetectedPlots]);
 
   // -------------------------------------------------------------------
   // 5. Toggle basemap visibility for schematic mode
@@ -365,8 +430,9 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
 
     // Also toggle CSIDC reference layer
     if (csidcRefLayerRef.current) {
+      const hasBbox = activeProject?.bbox && activeProject.bbox.length === 4;
       csidcRefLayerRef.current.setVisible(
-        viewMode !== "schematic" && showCsidcReference && csidcReferencePlots.length > 0
+        viewMode !== "schematic" && showCsidcReference && !!hasBbox
       );
     }
 
@@ -375,7 +441,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       containerRef.current.style.background =
         viewMode === "schematic" ? "#ffffff" : "#1a1a2e";
     }
-  }, [viewMode, showCsidcReference, csidcReferencePlots]);
+  }, [viewMode, showCsidcReference, activeProject?.bbox]);
 
   // -------------------------------------------------------------------
   // 6. Render deviation overlay from comparison results
@@ -502,6 +568,9 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       const map = mapRef.current;
       if (!map) return;
 
+      // Block clicks during boundary editing
+      if (editingPlotId !== null) return;
+
       // Prompt-detect mode: collect coordinate and fire detection
       if (promptMode) {
         const [lon, lat] = evt.coordinate;
@@ -532,7 +601,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
         selectPlot(null);
       }
     },
-    [promptMode, selectPlot, runPromptDetect]
+    [promptMode, selectPlot, runPromptDetect, editingPlotId]
   );
 
   useEffect(() => {
@@ -548,23 +617,204 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   }, [handleClick]);
 
   // -------------------------------------------------------------------
-  // 9. Cursor style for prompt mode
+  // 8b. Hover popup — show plot info on pointermove
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    // Create overlay once
+    if (!overlayRef.current && popupRef.current) {
+      overlayRef.current = new Overlay({
+        element: popupRef.current,
+        positioning: "bottom-center",
+        offset: [0, -12],
+        stopEvent: false,
+      });
+      map.addOverlay(overlayRef.current);
+    }
+
+    const overlay = overlayRef.current;
+    if (!overlay) return;
+
+    const handlePointerMove = (e: MapBrowserEvent<PointerEvent>) => {
+      if (promptMode || editingPlotId !== null) {
+        overlay.setPosition(undefined);
+        setHoverInfo(null);
+        return;
+      }
+
+      const plotLayer = plotLayerRef.current;
+      let hit = false;
+
+      map.forEachFeatureAtPixel(
+        e.pixel,
+        (feature) => {
+          const props = (feature as Feature).getProperties();
+          setHoverInfo({
+            label: props.label || "Unknown",
+            category: props.category || "plot",
+            color: props.color || "#3b82f6",
+          });
+          overlay.setPosition(e.coordinate);
+          hit = true;
+          return true; // stop iterating
+        },
+        {
+          layerFilter: (layer) => layer === plotLayer,
+          hitTolerance: 2,
+        }
+      );
+
+      if (!hit) {
+        overlay.setPosition(undefined);
+        setHoverInfo(null);
+      }
+
+      // Set cursor to pointer when hovering over a feature
+      if (containerRef.current && !promptMode && editingPlotId === null) {
+        containerRef.current.style.cursor = hit ? "pointer" : "";
+      }
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    map.on("pointermove", handlePointerMove as any);
+    return () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      map.un("pointermove", handlePointerMove as any);
+      // Note: overlay persists across re-renders and is cleaned up when the map unmounts
+    };
+  }, [promptMode, editingPlotId]);
+
+  // -------------------------------------------------------------------
+  // 9. Cursor style for prompt mode and edit mode
   // -------------------------------------------------------------------
   useEffect(() => {
     if (containerRef.current) {
-      containerRef.current.style.cursor = promptMode ? "crosshair" : "";
+      if (editingPlotId !== null) {
+        containerRef.current.style.cursor = "grab";
+      } else if (promptMode) {
+        containerRef.current.style.cursor = "crosshair";
+      } else {
+        containerRef.current.style.cursor = "";
+      }
     }
-  }, [promptMode]);
+  }, [promptMode, editingPlotId]);
+
+  // -------------------------------------------------------------------
+  // 10. Modify interaction for boundary editing
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    const plotLayer = plotLayerRef.current;
+    if (!map || !plotLayer) return;
+
+    // Clean up previous modify interaction
+    if (modifyRef.current) {
+      map.removeInteraction(modifyRef.current);
+      modifyRef.current = null;
+    }
+    editCollectionRef.current = null;
+
+    if (editingPlotId === null) return;
+
+    // Find the feature with the editing plot ID
+    const source = plotLayer.getSource();
+    if (!source) return;
+    const feature = source.getFeatureById(editingPlotId);
+    if (!feature) return;
+
+    // Create a collection with just this feature
+    const collection = new Collection<Feature<Geometry>>([feature as Feature<Geometry>]);
+    editCollectionRef.current = collection;
+
+    // Create the Modify interaction
+    const modify = new Modify({
+      features: collection,
+      style: new Style({
+        image: new CircleStyle({
+          radius: 6,
+          fill: new Fill({ color: "#00c8ff" }),
+          stroke: new Stroke({ color: "#ffffff", width: 2 }),
+        }),
+      }),
+    });
+
+    modify.on("modifyend", () => {
+      const geojsonFormat = new GeoJSON();
+      const geom = feature.getGeometry();
+      if (geom) {
+        const geojsonGeom = geojsonFormat.writeGeometryObject(geom) as {
+          type: string;
+          coordinates: number[] | number[][] | number[][][] | number[][][][];
+        };
+        updateEditingGeometry(geojsonGeom);
+      }
+    });
+
+    map.addInteraction(modify);
+    modifyRef.current = modify;
+
+    return () => {
+      if (modifyRef.current) {
+        map.removeInteraction(modifyRef.current);
+        modifyRef.current = null;
+      }
+      editCollectionRef.current = null;
+    };
+  }, [editingPlotId, updateEditingGeometry]);
+
+  // -------------------------------------------------------------------
+  // 11. Keyboard shortcuts for editing (Escape to cancel, Cmd/Ctrl+S to save)
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    if (editingPlotId === null) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancelEditing();
+      }
+      if (e.key === "s" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        saveEditing();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [editingPlotId, cancelEditing, saveEditing]);
 
   // -------------------------------------------------------------------
   // Render
   // -------------------------------------------------------------------
   return (
-    <div
-      ref={containerRef}
-      className="w-full h-full"
-      style={{ position: "relative" }}
-    />
+    <>
+      <div
+        ref={containerRef}
+        className="w-full h-full"
+        style={{ position: "relative" }}
+      />
+      {/* Hover popup for plot info — must be outside the map container so OL doesn't swallow it */}
+      <div
+        ref={popupRef}
+        className={`transition-opacity duration-150 ${hoverInfo ? "opacity-100" : "opacity-0 pointer-events-none"}`}
+        style={{ position: "absolute", zIndex: 10 }}
+      >
+        {hoverInfo && (
+          <div className="bg-gray-900/90 backdrop-blur-sm text-white rounded-lg shadow-xl px-3.5 py-2.5 text-xs whitespace-nowrap border border-white/10">
+            <div className="flex items-center gap-2 mb-1">
+              <span
+                className="w-3 h-3 rounded-sm flex-shrink-0 border border-white/20"
+                style={{ backgroundColor: hoverInfo.color }}
+              />
+              <span className="font-semibold text-sm">{hoverInfo.label}</span>
+            </div>
+            <div className="text-gray-300 capitalize">{hoverInfo.category}</div>
+          </div>
+        )}
+      </div>
+    </>
   );
 };
 

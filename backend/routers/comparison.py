@@ -53,7 +53,20 @@ async def compare_project(
         try:
             from backend.services.csidc_client import csidc_client
 
-            plots_data = await csidc_client.get_individual_plots(project.area_name)
+            # Get boundary geometry for spatial fallback
+            boundary_geom = None
+            bm_result = await db.execute(
+                select(BasemapCache).where(
+                    BasemapCache.area_name == project.area_name,
+                )
+            )
+            bm_entry = bm_result.scalars().first()
+            if bm_entry and bm_entry.geometry:
+                boundary_geom = bm_entry.geometry
+
+            plots_data = await csidc_client.get_individual_plots(
+                project.area_name, boundary_geometry=boundary_geom
+            )
             if plots_data:
                 for plot in plots_data:
                     basemap_features.append(
@@ -87,36 +100,28 @@ async def compare_project(
                 )
 
     if not basemap_features:
-        # Try to fetch outer boundary from CSIDC
+        # Try to ensure areas are cached locally, then read from DB
         try:
-            from backend.services.csidc_client import csidc_client
+            from backend.routers.areas import _ensure_areas_cached
 
             category = project.area_category or "industrial"
-            if category == "industrial":
-                areas = await csidc_client.get_industrial_areas()
-            elif category == "old_industrial":
-                areas = await csidc_client.get_old_industrial_areas()
-            else:
-                areas = await csidc_client.get_directorate_areas()
+            await _ensure_areas_cached(db, category)
 
-            for area in areas:
-                if area["name"] == project.area_name:
-                    basemap_features.append(
-                        {
-                            "name": area["name"],
-                            "geometry": area["geometry"],
-                            "properties": area.get("properties", {}),
-                        }
-                    )
-                    # Cache it
-                    cache_entry = BasemapCache(
-                        layer_name=category,
-                        area_name=area["name"],
-                        geometry_json=json.dumps(area["geometry"]),
-                        properties_json=json.dumps(area.get("properties", {})),
-                    )
-                    db.add(cache_entry)
-                    break
+            bm_result = await db.execute(
+                select(BasemapCache).where(
+                    BasemapCache.area_name == project.area_name,
+                    BasemapCache.layer_name == category,
+                )
+            )
+            bm_entry = bm_result.scalar_one_or_none()
+            if bm_entry:
+                basemap_features.append(
+                    {
+                        "name": bm_entry.area_name,
+                        "geometry": bm_entry.geometry,
+                        "properties": bm_entry.properties,
+                    }
+                )
         except Exception as e:
             logger.warning(f"Failed to fetch basemap: {e}")
 
