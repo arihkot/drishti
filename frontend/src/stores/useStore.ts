@@ -20,6 +20,8 @@ interface AppState {
   mapExtent: [number, number, number, number] | null;
   mapZoom: number;
   setMapView: (extent: [number, number, number, number], zoom: number) => void;
+  showCsidcReference: boolean;
+  toggleCsidcReference: () => void;
 
   // ---- Areas ----
   areas: IndustrialArea[];
@@ -95,6 +97,8 @@ export const useStore = create<AppState>((set, get) => ({
   mapExtent: null,
   mapZoom: 7,
   setMapView: (extent, zoom) => set({ mapExtent: extent, mapZoom: zoom }),
+  showCsidcReference: false,
+  toggleCsidcReference: () => set((s) => ({ showCsidcReference: !s.showCsidcReference })),
   loadWMSConfig: async () => {
     try {
       const config = await api.fetchWMSConfig();

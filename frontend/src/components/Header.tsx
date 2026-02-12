@@ -1,10 +1,12 @@
-import { Eye, Satellite, PanelLeft } from "lucide-react";
+import { Eye, Satellite, PanelLeft, MapPinned } from "lucide-react";
 import { useStore } from "../stores/useStore";
 
 export default function Header() {
   const viewMode = useStore((s) => s.viewMode);
   const setViewMode = useStore((s) => s.setViewMode);
   const toggleSidebar = useStore((s) => s.toggleSidebar);
+  const showCsidcReference = useStore((s) => s.showCsidcReference);
+  const toggleCsidcReference = useStore((s) => s.toggleCsidcReference);
 
   return (
     <header className="fixed top-0 left-0 right-0 z-50 h-14 bg-gradient-to-r from-orange-800 to-orange-600 flex items-center justify-between px-4 shadow-md">
@@ -52,6 +54,20 @@ export default function Header() {
             Schematic
           </button>
         </div>
+
+        {/* CSIDC reference layer toggle */}
+        <button
+          onClick={toggleCsidcReference}
+          className={`flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md border transition-colors ${
+            showCsidcReference
+              ? "bg-white text-orange-800 border-white"
+              : "text-white/70 border-white/30 hover:bg-white/10"
+          }`}
+          title="Toggle CSIDC reference plots overlay"
+        >
+          <MapPinned size={14} />
+          CSIDC Ref
+        </button>
 
         {/* Sidebar toggle */}
         <button

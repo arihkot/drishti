@@ -68,8 +68,10 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
             f"[TIMING] SAM detection: {t_sam - t_fetch:.2f}s | Raw masks: {len(raw_masks)}"
         )
 
-        # 3. Process masks into plots
-        plots_data = process_masks_to_plots(raw_masks, min_area_sqm=data.min_area_sqm)
+        # 3. Process masks into plots (pass satellite image for color-based classification)
+        plots_data = process_masks_to_plots(
+            raw_masks, min_area_sqm=data.min_area_sqm, image=image, meta=meta
+        )
         t_process = time.time()
         logger.info(
             f"[TIMING] Vectorization: {t_process - t_sam:.2f}s | Plots: {len(plots_data)}"
@@ -262,8 +264,8 @@ async def prompt_detect(data: PromptDetectRequest, db: AsyncSession = Depends(ge
             box_coords=box_coords,
         )
 
-        # Process masks
-        plots_data = process_masks_to_plots(raw_masks)
+        # Process masks (pass satellite image for color-based classification)
+        plots_data = process_masks_to_plots(raw_masks, image=image, meta=meta)
 
         # Get existing plot count for numbering
         existing_result = await db.execute(

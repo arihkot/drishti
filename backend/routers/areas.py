@@ -174,6 +174,7 @@ async def get_wms_config():
             "rivers": settings.LAYER_RIVERS,
             "substations": settings.LAYER_SUBSTATIONS,
         },
+        "reference_plots_layer": settings.LAYER_INDUSTRIAL_PLOTS,
         "satellite_url": settings.ESRI_SATELLITE_URL,
         "map_center": [settings.MAP_CENTER_LON, settings.MAP_CENTER_LAT],
         "map_zoom": settings.MAP_DEFAULT_ZOOM,

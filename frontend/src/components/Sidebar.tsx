@@ -15,10 +15,14 @@ import {
 import { useStore } from "../stores/useStore";
 
 const CATEGORY_COLORS: Record<string, string> = {
-  parcel: "#FF0000",
-  road: "#00BCD4",
-  infrastructure: "#4CAF50",
-  other: "#9E9E9E",
+  plot: "#ef4444",
+  road: "#64748b",
+  vegetation: "#22c55e",
+  open_land: "#d97706",
+  water: "#3b82f6",
+  building: "#a855f7",
+  infrastructure: "#f59e0b",
+  other: "#9ca3af",
 };
 
 const SEVERITY_COLORS: Record<string, string> = {
