@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useCallback, useState } from "react";
+import { createPortal } from "react-dom";
 import Map from "ol/Map";
 import View from "ol/View";
 import Overlay from "ol/Overlay";
@@ -19,7 +20,7 @@ import type { MapBrowserEvent } from "ol";
 import type { Geometry } from "ol/geom";
 
 import { useStore } from "../stores/useStore";
-import { fetchAreaBoundary } from "../api/client";
+import { fetchAreaBoundary, fetchReferencePlotsGeoJSON } from "../api/client";
 import type { PlotData } from "../types";
 
 // Register geographic (EPSG:4326) coordinate system globally
@@ -85,6 +86,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   const baseTileRef = useRef<TileLayer<XYZ> | null>(null);
   const wmsLayerRef = useRef<ImageLayer<ImageWMS> | null>(null);
   const csidcRefLayerRef = useRef<TileLayer<TileWMS> | null>(null);
+  const csidcRefVectorLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
   const boundaryLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
   const plotLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
   const deviationLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
@@ -94,12 +96,22 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   const editCollectionRef = useRef<Collection<Feature<Geometry>> | null>(null);
 
   // Hover popup refs
-  const popupRef = useRef<HTMLDivElement>(null);
+  const popupElRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<Overlay | null>(null);
   const [hoverInfo, setHoverInfo] = useState<{
     label: string;
     category: string;
     color: string;
+    source?: "detected" | "csidc_reference";
+    allottee?: string;
+    area_sqm?: number | null;
+    area_sqft?: number | null;
+    perimeter_m?: number | null;
+    confidence?: number | null;
+    status?: string;
+    plot_type?: string;
+    location?: string;
+    district?: string;
   } | null>(null);
 
   // Store slices
@@ -112,6 +124,8 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   const setAreaBoundary = useStore((s) => s.setAreaBoundary);
   const showCsidcReference = useStore((s) => s.showCsidcReference);
   const hideDetectedPlots = useStore((s) => s.hideDetectedPlots);
+  const csidcReferencePlots = useStore((s) => s.csidcReferencePlots);
+  const loadCsidcReferencePlots = useStore((s) => s.loadCsidcReferencePlots);
   const comparison = useStore((s) => s.comparison);
   const runPromptDetect = useStore((s) => s.runPromptDetect);
   const loadWMSConfig = useStore((s) => s.loadWMSConfig);
@@ -173,6 +187,21 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       opacity: 0.55,
     });
 
+    // CSIDC reference vector layer — for hover/tooltip interaction
+    const csidcRefVectorSource = new VectorSource<Feature<Geometry>>();
+    const csidcRefVectorLayer = new VectorLayer({
+      source: csidcRefVectorSource,
+      visible: false,
+      style: new Style({
+        fill: new Fill({ color: "rgba(34, 197, 94, 0.12)" }),
+        stroke: new Stroke({
+          color: "#16a34a",
+          width: 1.5,
+          lineDash: [6, 3],
+        }),
+      }),
+    });
+
     const deviationSource = new VectorSource<Feature<Geometry>>();
     const deviationLayer = new VectorLayer({
       source: deviationSource,
@@ -181,7 +210,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
 
     const map = new Map({
       target: containerRef.current,
-      layers: [baseTile, csidcRefLayer, boundaryLayer, plotLayer, deviationLayer],
+      layers: [baseTile, csidcRefLayer, csidcRefVectorLayer, boundaryLayer, plotLayer, deviationLayer],
       view: new View({
         center: [82, 20.8],
         zoom: 7,
@@ -191,10 +220,26 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
 
     baseTileRef.current = baseTile;
     csidcRefLayerRef.current = csidcRefLayer;
+    csidcRefVectorLayerRef.current = csidcRefVectorLayer;
     boundaryLayerRef.current = boundaryLayer;
     plotLayerRef.current = plotLayer;
     deviationLayerRef.current = deviationLayer;
     mapRef.current = map;
+
+    // Create hover popup overlay (DOM element created programmatically to avoid React ref timing issues)
+    const popupEl = document.createElement("div");
+    popupEl.style.position = "absolute";
+    popupEl.style.zIndex = "10";
+    popupElRef.current = popupEl;
+
+    const popupOverlay = new Overlay({
+      element: popupEl,
+      positioning: "bottom-center",
+      offset: [0, -12],
+      stopEvent: false,
+    });
+    map.addOverlay(popupOverlay);
+    overlayRef.current = popupOverlay;
 
     // Load WMS config on mount
     loadWMSConfig();
@@ -277,6 +322,54 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   }, [showCsidcReference, activeProject?.bbox]);
 
   // -------------------------------------------------------------------
+  // 2d. Auto-load CSIDC reference plots when ref/only modes are toggled
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    if ((showCsidcReference || hideDetectedPlots) && activeProject?.area_name) {
+      loadCsidcReferencePlots(
+        activeProject.area_name,
+        activeProject.area_category ?? "industrial"
+      );
+    }
+  }, [showCsidcReference, hideDetectedPlots, activeProject?.area_name, activeProject?.area_category, loadCsidcReferencePlots]);
+
+  // -------------------------------------------------------------------
+  // 2e. Populate CSIDC reference vector layer from cached data
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    const layer = csidcRefVectorLayerRef.current;
+    if (!layer) return;
+
+    const source = layer.getSource();
+    if (!source) return;
+    source.clear();
+
+    if (!csidcReferencePlots || csidcReferencePlots.features.length === 0) {
+      layer.setVisible(false);
+      return;
+    }
+
+    const geojsonFormat = new GeoJSON();
+    for (const feat of csidcReferencePlots.features) {
+      if (!feat.geometry) continue;
+      try {
+        const feature = geojsonFormat.readFeature(feat, {
+          dataProjection: "EPSG:4326",
+          featureProjection: "EPSG:4326",
+        }) as Feature<Geometry>;
+        feature.setId(feat.id);
+        source.addFeature(feature);
+      } catch {
+        // Skip invalid geometries
+      }
+    }
+
+    // Visibility follows the same logic as the WMS layer
+    const hasBbox = activeProject?.bbox && activeProject.bbox.length === 4;
+    layer.setVisible((showCsidcReference || hideDetectedPlots) && !!hasBbox);
+  }, [csidcReferencePlots, showCsidcReference, hideDetectedPlots, activeProject?.bbox]);
+
+  // -------------------------------------------------------------------
   // 3. Render plots as vector features
   // -------------------------------------------------------------------
   useEffect(() => {
@@ -304,6 +397,10 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
             label: plot.label,
             category: plot.category,
             color: plot.color,
+            area_sqm: plot.area_sqm,
+            area_sqft: plot.area_sqft,
+            perimeter_m: plot.perimeter_m,
+            confidence: plot.confidence,
           },
         },
         { dataProjection: "EPSG:4326", featureProjection: "EPSG:4326" }
@@ -436,12 +533,20 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       );
     }
 
+    // Also toggle CSIDC reference vector layer
+    if (csidcRefVectorLayerRef.current) {
+      const hasBbox = activeProject?.bbox && activeProject.bbox.length === 4;
+      csidcRefVectorLayerRef.current.setVisible(
+        viewMode !== "schematic" && (showCsidcReference || hideDetectedPlots) && !!hasBbox
+      );
+    }
+
     // Update container background for schematic view
     if (containerRef.current) {
       containerRef.current.style.background =
         viewMode === "schematic" ? "#ffffff" : "#1a1a2e";
     }
-  }, [viewMode, showCsidcReference, activeProject?.bbox]);
+  }, [viewMode, showCsidcReference, hideDetectedPlots, activeProject?.bbox]);
 
   // -------------------------------------------------------------------
   // 6. Render deviation overlay from comparison results
@@ -621,21 +726,8 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   // -------------------------------------------------------------------
   useEffect(() => {
     const map = mapRef.current;
-    if (!map) return;
-
-    // Create overlay once
-    if (!overlayRef.current && popupRef.current) {
-      overlayRef.current = new Overlay({
-        element: popupRef.current,
-        positioning: "bottom-center",
-        offset: [0, -12],
-        stopEvent: false,
-      });
-      map.addOverlay(overlayRef.current);
-    }
-
     const overlay = overlayRef.current;
-    if (!overlay) return;
+    if (!map || !overlay) return;
 
     const handlePointerMove = (e: MapBrowserEvent<PointerEvent>) => {
       if (promptMode || editingPlotId !== null) {
@@ -645,26 +737,64 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       }
 
       const plotLayer = plotLayerRef.current;
+      const csidcRefVectorLayer = csidcRefVectorLayerRef.current;
       let hit = false;
 
-      map.forEachFeatureAtPixel(
-        e.pixel,
-        (feature) => {
-          const props = (feature as Feature).getProperties();
-          setHoverInfo({
-            label: props.label || "Unknown",
-            category: props.category || "plot",
-            color: props.color || "#3b82f6",
-          });
-          overlay.setPosition(e.coordinate);
-          hit = true;
-          return true; // stop iterating
-        },
-        {
-          layerFilter: (layer) => layer === plotLayer,
-          hitTolerance: 2,
-        }
-      );
+      // 1. First, try detected plot layer (unless hidden)
+      if (plotLayer && !hideDetectedPlots) {
+        map.forEachFeatureAtPixel(
+          e.pixel,
+          (feature) => {
+            const props = (feature as Feature).getProperties();
+            setHoverInfo({
+              label: props.label || "Unknown",
+              category: props.category || "plot",
+              color: props.color || "#3b82f6",
+              source: "detected",
+              area_sqm: props.area_sqm ?? null,
+              area_sqft: props.area_sqft ?? null,
+              perimeter_m: props.perimeter_m ?? null,
+              confidence: props.confidence ?? null,
+            });
+            overlay.setPosition(e.coordinate);
+            hit = true;
+            return true; // stop iterating
+          },
+          {
+            layerFilter: (layer) => layer === plotLayer,
+            hitTolerance: 2,
+          }
+        );
+      }
+
+      // 2. If no detected plot hit, try CSIDC reference vector layer
+      if (!hit && csidcRefVectorLayer && csidcRefVectorLayer.getVisible()) {
+        map.forEachFeatureAtPixel(
+          e.pixel,
+          (feature) => {
+            const props = (feature as Feature).getProperties();
+            setHoverInfo({
+              label: props.name || "Unknown Plot",
+              category: "CSIDC Reference",
+              color: "#16a34a",
+              source: "csidc_reference",
+              allottee: props.allottee || undefined,
+              area_sqm: props.area_sqm ?? null,
+              status: props.status || undefined,
+              plot_type: props.plot_type || undefined,
+              location: props.location || undefined,
+              district: props.district || undefined,
+            });
+            overlay.setPosition(e.coordinate);
+            hit = true;
+            return true;
+          },
+          {
+            layerFilter: (layer) => layer === csidcRefVectorLayer,
+            hitTolerance: 2,
+          }
+        );
+      }
 
       if (!hit) {
         overlay.setPosition(undefined);
@@ -684,7 +814,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       map.un("pointermove", handlePointerMove as any);
       // Note: overlay persists across re-renders and is cleaned up when the map unmounts
     };
-  }, [promptMode, editingPlotId]);
+  }, [promptMode, editingPlotId, hideDetectedPlots, showCsidcReference]);
 
   // -------------------------------------------------------------------
   // 9. Cursor style for prompt mode and edit mode
@@ -788,6 +918,113 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   // -------------------------------------------------------------------
   // Render
   // -------------------------------------------------------------------
+  const popupContent = (
+    <div
+      className={`transition-opacity duration-150 ${hoverInfo ? "opacity-100" : "opacity-0 pointer-events-none"}`}
+    >
+      {hoverInfo && (
+        <div className="bg-black/80 text-white rounded-lg shadow-xl px-3.5 py-2.5 text-xs whitespace-nowrap border border-white/15 max-w-xs">
+          <div className="flex items-center gap-2 mb-1">
+            <span
+              className="w-3 h-3 rounded-sm flex-shrink-0 border border-white/20"
+              style={{ backgroundColor: hoverInfo.color }}
+            />
+            <span className="font-semibold text-sm text-white">{hoverInfo.label}</span>
+          </div>
+          <div className="text-gray-200 capitalize">{hoverInfo.category}</div>
+
+          {/* Details for detected plots */}
+          {hoverInfo.source === "detected" && (
+            <div className="mt-1.5 pt-1.5 border-t border-white/15 space-y-0.5">
+              {hoverInfo.area_sqm != null && (
+                <div>
+                  <span className="text-gray-400">Area:</span>{" "}
+                  <span className="text-white">
+                    {hoverInfo.area_sqm.toLocaleString(undefined, {
+                      maximumFractionDigits: 1,
+                    })}{" "}
+                    sqm
+                    {hoverInfo.area_sqft != null && (
+                      <span className="text-gray-300">
+                        {" "}({hoverInfo.area_sqft.toLocaleString(undefined, { maximumFractionDigits: 0 })} sqft)
+                      </span>
+                    )}
+                  </span>
+                </div>
+              )}
+              {hoverInfo.perimeter_m != null && (
+                <div>
+                  <span className="text-gray-400">Perimeter:</span>{" "}
+                  <span className="text-white">
+                    {hoverInfo.perimeter_m.toLocaleString(undefined, {
+                      maximumFractionDigits: 1,
+                    })}{" "}
+                    m
+                  </span>
+                </div>
+              )}
+              {hoverInfo.confidence != null && (
+                <div>
+                  <span className="text-gray-400">Confidence:</span>{" "}
+                  <span className="text-white">
+                    {(hoverInfo.confidence * 100).toFixed(1)}%
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Details for CSIDC reference plots */}
+          {hoverInfo.source === "csidc_reference" && (
+            <div className="mt-1.5 pt-1.5 border-t border-white/15 space-y-0.5">
+              {hoverInfo.plot_type && (
+                <div>
+                  <span className="text-gray-400">Type:</span>{" "}
+                  <span className="text-white">{hoverInfo.plot_type}</span>
+                </div>
+              )}
+              {hoverInfo.status && (
+                <div>
+                  <span className="text-gray-400">Status:</span>{" "}
+                  <span className="text-white">{hoverInfo.status}</span>
+                </div>
+              )}
+              {hoverInfo.allottee && (
+                <div>
+                  <span className="text-gray-400">Allottee:</span>{" "}
+                  <span className="text-white">{hoverInfo.allottee}</span>
+                </div>
+              )}
+              {hoverInfo.area_sqm != null && (
+                <div>
+                  <span className="text-gray-400">Area:</span>{" "}
+                  <span className="text-white">
+                    {hoverInfo.area_sqm.toLocaleString(undefined, {
+                      maximumFractionDigits: 1,
+                    })}{" "}
+                    sqm
+                  </span>
+                </div>
+              )}
+              {hoverInfo.location && (
+                <div>
+                  <span className="text-gray-400">Location:</span>{" "}
+                  <span className="text-white">{hoverInfo.location}</span>
+                </div>
+              )}
+              {hoverInfo.district && (
+                <div>
+                  <span className="text-gray-400">District:</span>{" "}
+                  <span className="text-white">{hoverInfo.district}</span>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <>
       <div
@@ -795,25 +1032,8 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
         className="w-full h-full"
         style={{ position: "relative" }}
       />
-      {/* Hover popup for plot info — must be outside the map container so OL doesn't swallow it */}
-      <div
-        ref={popupRef}
-        className={`transition-opacity duration-150 ${hoverInfo ? "opacity-100" : "opacity-0 pointer-events-none"}`}
-        style={{ position: "absolute", zIndex: 10 }}
-      >
-        {hoverInfo && (
-          <div className="bg-gray-900/90 backdrop-blur-sm text-white rounded-lg shadow-xl px-3.5 py-2.5 text-xs whitespace-nowrap border border-white/10">
-            <div className="flex items-center gap-2 mb-1">
-              <span
-                className="w-3 h-3 rounded-sm flex-shrink-0 border border-white/20"
-                style={{ backgroundColor: hoverInfo.color }}
-              />
-              <span className="font-semibold text-sm">{hoverInfo.label}</span>
-            </div>
-            <div className="text-gray-300 capitalize">{hoverInfo.category}</div>
-          </div>
-        )}
-      </div>
+      {/* Portal popup content into the OL overlay element */}
+      {popupElRef.current && createPortal(popupContent, popupElRef.current)}
     </>
   );
 };

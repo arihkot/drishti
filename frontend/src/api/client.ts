@@ -11,6 +11,7 @@ import type {
   ModelStatus,
   GeoJSONFeatureCollection,
   GeoJSONGeometry,
+  CsidcReferencePlotsGeoJSON,
 } from "../types";
 
 const BASE = "";
@@ -56,6 +57,15 @@ export async function fetchDistricts(): Promise<{
   total: number;
 }> {
   return request("/api/areas/districts");
+}
+
+export async function fetchReferencePlotsGeoJSON(
+  areaName: string,
+  category = "industrial"
+): Promise<CsidcReferencePlotsGeoJSON> {
+  return request(
+    `/api/areas/${encodeURIComponent(areaName)}/reference-plots/geojson?category=${category}`
+  );
 }
 
 // ---- Projects ----

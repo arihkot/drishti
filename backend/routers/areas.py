@@ -401,6 +401,156 @@ async def wms_proxy(request: Request, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=502, detail=f"WMS proxy failed: {str(e)}")
 
 
+@router.get("/{area_name}/reference-plots/geojson")
+async def get_reference_plots_geojson(
+    area_name: str,
+    category: str = Query("industrial"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get CSIDC reference plots as a GeoJSON FeatureCollection.
+
+    Optimized for direct use by the frontend map vector layer.
+    Fetches from CSIDC on first call, caches in local DB, serves from cache
+    thereafter -- so hover/tooltip is instant without hitting the remote server.
+    """
+    # Check cache first
+    result = await db.execute(
+        select(CsidcReferencePlot).where(
+            CsidcReferencePlot.area_name == area_name,
+        )
+    )
+    cached = list(result.scalars().all())
+
+    if not cached:
+        # Fetch from CSIDC and cache
+        try:
+            # Get the boundary geometry for spatial fallback
+            boundary_geom = None
+            bm_result = await db.execute(
+                select(BasemapCache).where(
+                    BasemapCache.area_name == area_name,
+                )
+            )
+            bm_entry = bm_result.scalars().first()
+            if bm_entry and bm_entry.geometry:
+                boundary_geom = bm_entry.geometry
+
+            plots = await csidc_client.get_individual_plots(
+                area_name, boundary_geometry=boundary_geom
+            )
+
+            if plots:
+                for plot in plots:
+                    entry = CsidcReferencePlot(
+                        area_name=area_name,
+                        plot_name=plot.get("name"),
+                        geometry_json=json.dumps(plot["geometry"]),
+                        properties_json=json.dumps(plot.get("properties", {})),
+                    )
+                    db.add(entry)
+                await db.flush()
+                logger.info(
+                    f"Fetched & cached {len(plots)} reference plots for {area_name}"
+                )
+
+            # Re-read from DB to get IDs
+            result = await db.execute(
+                select(CsidcReferencePlot).where(
+                    CsidcReferencePlot.area_name == area_name,
+                )
+            )
+            cached = list(result.scalars().all())
+        except Exception as e:
+            logger.error(f"Failed to fetch reference plots for {area_name}: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to fetch reference plots from CSIDC: {str(e)}",
+            )
+
+    # Build GeoJSON FeatureCollection
+    features = []
+    for p in cached:
+        geom = p.geometry
+        props = p.properties or {}
+        if not geom:
+            continue
+        # Extract useful display properties
+        plot_name = (
+            p.plot_name
+            or props.get("plotno_inf")
+            or props.get("PLOT_NO")
+            or props.get("plot_no")
+            or props.get("plot_name")
+            or props.get("kh_no")
+            or f"Plot-{p.id}"
+        )
+        allottee = (
+            props.get("allottee")
+            or props.get("ALLOTTEE")
+            or props.get("allottee_name")
+            or props.get("allottee_n")
+            or props.get("firm_name")
+            or props.get("FIRM_NAME")
+            or props.get("allotmentr")
+            or ""
+        )
+        area_val = (
+            props.get("total_area")
+            or props.get("area_sqm")
+            or props.get("AREA_SQM")
+            or props.get("shape_area")
+            or props.get("Shape_Area")
+            or props.get("SHAPE_AREA")
+            or props.get("st_area_sh")
+            or None
+        )
+        status = (
+            props.get("status_inf")
+            or props.get("status_from_csidc")
+            or props.get("status")
+            or props.get("STATUS")
+            or props.get("allot_status")
+            or props.get("category_i")
+            or ""
+        )
+        plot_type = props.get("plot_type") or props.get("PLOT_TYPE") or ""
+        location = props.get("location") or props.get("LOCATION") or ""
+        district = (
+            props.get("district")
+            or props.get("DISTRICT")
+            or props.get("district_i")
+            or ""
+        )
+        features.append(
+            {
+                "type": "Feature",
+                "id": f"csidc-{p.id}",
+                "geometry": geom,
+                "properties": {
+                    "ref_id": p.id,
+                    "name": str(plot_name),
+                    "allottee": str(allottee),
+                    "area_sqm": float(area_val) if area_val else None,
+                    "status": str(status),
+                    "plot_type": str(plot_type),
+                    "location": str(location),
+                    "district": str(district),
+                    "source": "csidc_reference",
+                },
+            }
+        )
+
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "properties": {
+            "area_name": area_name,
+            "total": len(features),
+            "source": "cache" if cached else "csidc",
+        },
+    }
+
+
 @router.get("/districts")
 async def list_districts():
     """List all districts."""

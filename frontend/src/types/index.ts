@@ -151,3 +151,31 @@ export type DeviationType =
 export type Severity = "low" | "medium" | "high" | "critical";
 
 export type PlotCategory = "plot" | "road" | "open_land" | "building" | "infrastructure" | "other";
+
+// ---- CSIDC Reference types ----
+export interface CsidcReferencePlotProperties {
+  ref_id: number;
+  name: string;
+  allottee: string;
+  area_sqm: number | null;
+  status: string;
+  source: "csidc_reference";
+  [key: string]: unknown;
+}
+
+export interface CsidcReferencePlotFeature {
+  type: "Feature";
+  id: string;
+  geometry: GeoJSONGeometry;
+  properties: CsidcReferencePlotProperties;
+}
+
+export interface CsidcReferencePlotsGeoJSON {
+  type: "FeatureCollection";
+  features: CsidcReferencePlotFeature[];
+  properties: {
+    area_name: string;
+    total: number;
+    source: string;
+  };
+}

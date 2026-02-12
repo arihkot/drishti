@@ -6,6 +6,7 @@ import type {
   ComparisonResult,
   WMSConfig,
   GeoJSONGeometry,
+  CsidcReferencePlotsGeoJSON,
 } from "../types";
 import * as api from "../api/client";
 
@@ -25,6 +26,9 @@ interface AppState {
   toggleCsidcReference: () => void;
   hideDetectedPlots: boolean;
   toggleHideDetectedPlots: () => void;
+  csidcReferencePlots: CsidcReferencePlotsGeoJSON | null;
+  csidcRefLoading: boolean;
+  loadCsidcReferencePlots: (areaName: string, category?: string) => Promise<void>;
 
   // ---- Areas ----
   areas: IndustrialArea[];
@@ -123,6 +127,21 @@ export const useStore = create<AppState>((set, get) => ({
       return { hideDetectedPlots: newHide };
     });
   },
+  csidcReferencePlots: null,
+  csidcRefLoading: false,
+  loadCsidcReferencePlots: async (areaName, category) => {
+    // Skip if already loaded for this area
+    const current = get().csidcReferencePlots;
+    if (current && current.properties?.area_name === areaName) return;
+    set({ csidcRefLoading: true });
+    try {
+      const data = await api.fetchReferencePlotsGeoJSON(areaName, category);
+      set({ csidcReferencePlots: data, csidcRefLoading: false });
+    } catch (e) {
+      set({ csidcRefLoading: false });
+      get().showToast(`Failed to load CSIDC reference plots: ${e}`, "error");
+    }
+  },
   loadWMSConfig: async () => {
     try {
       const config = await api.fetchWMSConfig();
@@ -147,7 +166,7 @@ export const useStore = create<AppState>((set, get) => ({
       get().showToast(`Failed to load areas: ${e}`, "error");
     }
   },
-  selectArea: (area) => set({ selectedArea: area, areaBoundary: null }),
+  selectArea: (area) => set({ selectedArea: area, areaBoundary: null, csidcReferencePlots: null }),
   setAreaBoundary: (boundary) => set({ areaBoundary: boundary }),
 
   // ---- Project ----
