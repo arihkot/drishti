@@ -58,6 +58,17 @@ export async function fetchDistricts(): Promise<{
   return request("/api/areas/districts");
 }
 
+export async function fetchReferencePlots(
+  areaName: string
+): Promise<{
+  area_name: string;
+  plots: { name: string; geometry: GeoJSONGeometry; properties: Record<string, unknown> }[];
+  total: number;
+  source: string;
+}> {
+  return request(`/api/areas/${encodeURIComponent(areaName)}/reference-plots`);
+}
+
 // ---- Projects ----
 export async function fetchProjects(): Promise<{ projects: Project[] }> {
   return request("/api/projects");

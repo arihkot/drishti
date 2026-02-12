@@ -162,3 +162,28 @@ class SatelliteCache(Base):
     width = Column(Integer, nullable=True)
     height = Column(Integer, nullable=True)
     fetched_at = Column(DateTime, default=utcnow)
+
+
+class CsidcReferencePlot(Base):
+    """Cached individual plot features from CSIDC GeoServer per area."""
+
+    __tablename__ = "csidc_reference_plots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    area_name = Column(String(255), nullable=False, index=True)
+    plot_name = Column(String(255), nullable=True)
+    geometry_json = Column(Text, nullable=False)
+    properties_json = Column(Text, nullable=True)
+    fetched_at = Column(DateTime, default=utcnow)
+
+    @property
+    def geometry(self):
+        if self.geometry_json:
+            return json.loads(self.geometry_json)
+        return None
+
+    @property
+    def properties(self):
+        if self.properties_json:
+            return json.loads(self.properties_json)
+        return {}

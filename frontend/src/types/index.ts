@@ -34,7 +34,6 @@ export interface WMSConfig {
   wms_url: string;
   workspace: string;
   layers: Record<string, string>;
-  reference_plots_layer: string;
   satellite_url: string;
   map_center: [number, number];
   map_zoom: number;
@@ -152,3 +151,9 @@ export type DeviationType =
 export type Severity = "low" | "medium" | "high" | "critical";
 
 export type PlotCategory = "plot" | "road" | "vegetation" | "open_land" | "water" | "building" | "infrastructure" | "other";
+
+export interface CsidcReferencePlot {
+  name: string;
+  geometry: GeoJSONGeometry;
+  properties: Record<string, unknown>;
+}

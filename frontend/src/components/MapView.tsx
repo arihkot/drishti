@@ -85,7 +85,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   // Layer refs so we can update them without recreating the map
   const baseTileRef = useRef<TileLayer<XYZ> | null>(null);
   const wmsLayerRef = useRef<ImageLayer<ImageWMS> | null>(null);
-  const csidcPlotsLayerRef = useRef<ImageLayer<ImageWMS> | null>(null);
+  const csidcRefLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
   const boundaryLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
   const plotLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
   const deviationLayerRef = useRef<VectorLayer<VectorSource<Feature<Geometry>>> | null>(null);
@@ -99,6 +99,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   const selectedArea = useStore((s) => s.selectedArea);
   const setAreaBoundary = useStore((s) => s.setAreaBoundary);
   const showCsidcReference = useStore((s) => s.showCsidcReference);
+  const csidcReferencePlots = useStore((s) => s.csidcReferencePlots);
   const comparison = useStore((s) => s.comparison);
   const runPromptDetect = useStore((s) => s.runPromptDetect);
   const loadWMSConfig = useStore((s) => s.loadWMSConfig);
@@ -135,6 +136,16 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       }),
     });
 
+    const csidcRefSource = new VectorSource<Feature<Geometry>>();
+    const csidcRefLayer = new VectorLayer({
+      source: csidcRefSource,
+      visible: false,
+      style: new Style({
+        fill: new Fill({ color: "rgba(251, 191, 36, 0.12)" }),
+        stroke: new Stroke({ color: "#f59e0b", width: 1.5 }),
+      }),
+    });
+
     const deviationSource = new VectorSource<Feature<Geometry>>();
     const deviationLayer = new VectorLayer({
       source: deviationSource,
@@ -143,7 +154,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
 
     const map = new Map({
       target: containerRef.current,
-      layers: [baseTile, boundaryLayer, plotLayer, deviationLayer],
+      layers: [baseTile, csidcRefLayer, boundaryLayer, plotLayer, deviationLayer],
       view: new View({
         center: [82, 20.8],
         zoom: 7,
@@ -152,6 +163,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
     });
 
     baseTileRef.current = baseTile;
+    csidcRefLayerRef.current = csidcRefLayer;
     boundaryLayerRef.current = boundaryLayer;
     plotLayerRef.current = plotLayer;
     deviationLayerRef.current = deviationLayer;
@@ -210,45 +222,52 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
   }, [wmsConfig]);
 
   // -------------------------------------------------------------------
-  // 2b. Add / update CSIDC reference plots WMS overlay
+  // 2b. Populate CSIDC reference vector layer from cached data
   // -------------------------------------------------------------------
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !wmsConfig) return;
+    const layer = csidcRefLayerRef.current;
+    if (!layer) return;
 
-    // Remove old CSIDC plots layer if present
-    if (csidcPlotsLayerRef.current) {
-      map.removeLayer(csidcPlotsLayerRef.current);
+    const source = layer.getSource();
+    if (!source) return;
+    source.clear();
+
+    if (csidcReferencePlots.length === 0) {
+      layer.setVisible(false);
+      return;
     }
 
-    const csidcPlotsLayer = new ImageLayer({
-      source: new ImageWMS({
-        url: wmsConfig.wms_url,
-        params: {
-          LAYERS: wmsConfig.reference_plots_layer,
-          FORMAT: "image/png",
-          TRANSPARENT: true,
-        },
-        serverType: "geoserver",
-      }),
-      opacity: 0.5,
-      visible: showCsidcReference && !!selectedArea,
-    });
+    const geojsonFormat = new GeoJSON();
+    for (const plot of csidcReferencePlots) {
+      if (!plot.geometry) continue;
+      try {
+        const feature = geojsonFormat.readFeature(
+          {
+            type: "Feature",
+            geometry: plot.geometry,
+            properties: { name: plot.name, ...plot.properties },
+          },
+          { dataProjection: "EPSG:4326", featureProjection: "EPSG:4326" }
+        ) as Feature<Geometry>;
+        source.addFeature(feature);
+      } catch {
+        // Skip invalid geometry
+      }
+    }
 
-    // Insert above the general WMS layer but below boundary/vector layers
-    // Layer order: baseTile(0), wms(1), csidcPlots(2), boundary(3), plots(4), deviations(5)
-    map.getLayers().insertAt(2, csidcPlotsLayer);
-    csidcPlotsLayerRef.current = csidcPlotsLayer;
-  }, [wmsConfig]);
+    layer.setVisible(showCsidcReference);
+  }, [csidcReferencePlots, showCsidcReference]);
 
   // -------------------------------------------------------------------
-  // 2c. Toggle CSIDC reference plots layer visibility
+  // 2c. Toggle CSIDC reference layer visibility
   // -------------------------------------------------------------------
   useEffect(() => {
-    if (csidcPlotsLayerRef.current) {
-      csidcPlotsLayerRef.current.setVisible(showCsidcReference && !!selectedArea);
+    if (csidcRefLayerRef.current) {
+      csidcRefLayerRef.current.setVisible(
+        showCsidcReference && csidcReferencePlots.length > 0
+      );
     }
-  }, [showCsidcReference, selectedArea]);
+  }, [showCsidcReference, csidcReferencePlots]);
 
   // -------------------------------------------------------------------
   // 3. Render plots as vector features
@@ -345,9 +364,9 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
     }
 
     // Also toggle CSIDC reference layer
-    if (csidcPlotsLayerRef.current) {
-      csidcPlotsLayerRef.current.setVisible(
-        viewMode !== "schematic" && showCsidcReference && !!selectedArea
+    if (csidcRefLayerRef.current) {
+      csidcRefLayerRef.current.setVisible(
+        viewMode !== "schematic" && showCsidcReference && csidcReferencePlots.length > 0
       );
     }
 
@@ -356,7 +375,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       containerRef.current.style.background =
         viewMode === "schematic" ? "#ffffff" : "#1a1a2e";
     }
-  }, [viewMode, showCsidcReference, selectedArea]);
+  }, [viewMode, showCsidcReference, csidcReferencePlots]);
 
   // -------------------------------------------------------------------
   // 6. Render deviation overlay from comparison results

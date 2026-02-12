@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
-from backend.models import BasemapCache
+from backend.models import BasemapCache, CsidcReferencePlot
 from backend.services.csidc_client import csidc_client
 
 logger = logging.getLogger(__name__)
@@ -174,11 +174,90 @@ async def get_wms_config():
             "rivers": settings.LAYER_RIVERS,
             "substations": settings.LAYER_SUBSTATIONS,
         },
-        "reference_plots_layer": settings.LAYER_INDUSTRIAL_PLOTS,
         "satellite_url": settings.ESRI_SATELLITE_URL,
         "map_center": [settings.MAP_CENTER_LON, settings.MAP_CENTER_LAT],
         "map_zoom": settings.MAP_DEFAULT_ZOOM,
     }
+
+
+@router.get("/{area_name}/reference-plots")
+async def get_reference_plots(
+    area_name: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get cached CSIDC reference plots for an area.
+
+    Fetches from CSIDC once, caches in local DB, serves from cache thereafter.
+    """
+    # Check cache first
+    result = await db.execute(
+        select(CsidcReferencePlot).where(
+            CsidcReferencePlot.area_name == area_name,
+        )
+    )
+    cached = result.scalars().all()
+
+    if cached:
+        logger.info(f"Serving {len(cached)} cached reference plots for {area_name}")
+        return {
+            "area_name": area_name,
+            "plots": [
+                {
+                    "id": p.id,
+                    "name": p.plot_name,
+                    "geometry": p.geometry,
+                    "properties": p.properties,
+                }
+                for p in cached
+            ],
+            "total": len(cached),
+            "source": "cache",
+        }
+
+    # Fetch from CSIDC and cache
+    try:
+        plots = await csidc_client.get_individual_plots(area_name)
+
+        if not plots:
+            return {
+                "area_name": area_name,
+                "plots": [],
+                "total": 0,
+                "source": "csidc",
+            }
+
+        for plot in plots:
+            entry = CsidcReferencePlot(
+                area_name=area_name,
+                plot_name=plot.get("name"),
+                geometry_json=json.dumps(plot["geometry"]),
+                properties_json=json.dumps(plot.get("properties", {})),
+            )
+            db.add(entry)
+
+        await db.flush()
+        logger.info(f"Fetched & cached {len(plots)} reference plots for {area_name}")
+
+        return {
+            "area_name": area_name,
+            "plots": [
+                {
+                    "name": p.get("name"),
+                    "geometry": p["geometry"],
+                    "properties": p.get("properties", {}),
+                }
+                for p in plots
+            ],
+            "total": len(plots),
+            "source": "csidc",
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to fetch reference plots for {area_name}: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch reference plots from CSIDC: {str(e)}",
+        )
 
 
 @router.get("/districts")

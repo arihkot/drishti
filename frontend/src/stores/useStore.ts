@@ -5,6 +5,7 @@ import type {
   Project,
   ComparisonResult,
   WMSConfig,
+  CsidcReferencePlot,
 } from "../types";
 import * as api from "../api/client";
 
@@ -22,6 +23,9 @@ interface AppState {
   setMapView: (extent: [number, number, number, number], zoom: number) => void;
   showCsidcReference: boolean;
   toggleCsidcReference: () => void;
+  csidcReferencePlots: CsidcReferencePlot[];
+  csidcReferenceLoading: boolean;
+  loadCsidcReferencePlots: (areaName: string) => Promise<void>;
 
   // ---- Areas ----
   areas: IndustrialArea[];
@@ -98,7 +102,35 @@ export const useStore = create<AppState>((set, get) => ({
   mapZoom: 7,
   setMapView: (extent, zoom) => set({ mapExtent: extent, mapZoom: zoom }),
   showCsidcReference: false,
-  toggleCsidcReference: () => set((s) => ({ showCsidcReference: !s.showCsidcReference })),
+  toggleCsidcReference: () => {
+    const state = get();
+    const newVal = !state.showCsidcReference;
+    set({ showCsidcReference: newVal });
+    // Auto-load reference plots when toggling on + area selected
+    if (newVal && state.selectedArea && state.csidcReferencePlots.length === 0) {
+      state.loadCsidcReferencePlots(state.selectedArea.name);
+    }
+  },
+  csidcReferencePlots: [],
+  csidcReferenceLoading: false,
+  loadCsidcReferencePlots: async (areaName) => {
+    set({ csidcReferenceLoading: true });
+    try {
+      const data = await api.fetchReferencePlots(areaName);
+      set({ csidcReferencePlots: data.plots, csidcReferenceLoading: false });
+      if (data.total === 0) {
+        get().showToast(`No CSIDC reference plots found for ${areaName}`, "info");
+      } else {
+        get().showToast(
+          `Loaded ${data.total} reference plots (${data.source})`,
+          "success"
+        );
+      }
+    } catch (e) {
+      set({ csidcReferenceLoading: false });
+      get().showToast(`Failed to load reference plots: ${e}`, "error");
+    }
+  },
   loadWMSConfig: async () => {
     try {
       const config = await api.fetchWMSConfig();
@@ -123,7 +155,7 @@ export const useStore = create<AppState>((set, get) => ({
       get().showToast(`Failed to load areas: ${e}`, "error");
     }
   },
-  selectArea: (area) => set({ selectedArea: area, areaBoundary: null }),
+  selectArea: (area) => set({ selectedArea: area, areaBoundary: null, csidcReferencePlots: [] }),
   setAreaBoundary: (boundary) => set({ areaBoundary: boundary }),
 
   // ---- Project ----
