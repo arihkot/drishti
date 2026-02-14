@@ -26,6 +26,34 @@ class ExportRequest(BaseModel):
     include_deviations: bool = True
 
 
+class DashboardExportRequest(BaseModel):
+    stats: dict
+    user: dict | None = None
+
+
+@router.post("/dashboard/pdf")
+async def export_dashboard_pdf(data: DashboardExportRequest):
+    """Generate and download a PDF report of dashboard statistics."""
+    from backend.services.pdf_generator import generate_dashboard_pdf
+
+    try:
+        pdf_path = generate_dashboard_pdf(
+            stats=data.stats,
+            user=data.user,
+        )
+
+        return FileResponse(
+            str(pdf_path),
+            media_type="application/pdf",
+            filename=pdf_path.name,
+        )
+    except Exception as e:
+        logger.exception(f"Dashboard PDF generation failed: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Dashboard PDF generation failed: {str(e)}"
+        )
+
+
 @router.post("/{project_id}/pdf")
 async def export_pdf(
     project_id: int,
@@ -158,6 +186,40 @@ async def export_pdf(
             f"Loaded {len(csidc_ref_plots)} CSIDC reference plots for {project.area_name}"
         )
 
+    # Load compliance data (green cover + construction timeline)
+    # If no prior compliance run exists, auto-run it now so the PDF always
+    # includes the compliance section.
+    compliance_results = None
+    compliance_summary = None
+    try:
+        from backend.services.compliance import (
+            get_compliance_results,
+            run_compliance_checks,
+        )
+
+        compliance_data = await get_compliance_results(db, project_id)
+
+        # Auto-run compliance checks if no cached results exist
+        if not compliance_data or not compliance_data.get("results"):
+            logger.info(
+                "No cached compliance data found — running compliance checks now"
+            )
+            compliance_data = await run_compliance_checks(
+                db,
+                project_id,
+                image=satellite_image,
+                meta=satellite_meta,
+            )
+
+        if compliance_data:
+            compliance_results = compliance_data.get("results")
+            compliance_summary = compliance_data.get("summary")
+            logger.info(
+                f"Loaded compliance data: {len(compliance_results or [])} results"
+            )
+    except Exception as e:
+        logger.warning(f"Failed to load compliance data: {e}")
+
     # Generate PDF
     try:
         pdf_path = generate_pdf_report(
@@ -171,6 +233,8 @@ async def export_pdf(
             satellite_meta=satellite_meta,
             boundary_geom=boundary_geom,
             csidc_ref_plots=csidc_ref_plots if csidc_ref_plots else None,
+            compliance_results=compliance_results if compliance_results else None,
+            compliance_summary=compliance_summary if compliance_summary else None,
         )
 
         return FileResponse(

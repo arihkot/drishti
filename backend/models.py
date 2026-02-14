@@ -200,3 +200,72 @@ class WmsTileCache(Base):
     content_type = Column(String(64), nullable=False, default="image/png")
     tile_data = Column(LargeBinary, nullable=False)
     fetched_at = Column(DateTime, default=utcnow)
+
+
+class AllotmentRecord(Base):
+    """Allotment data for a plot — fetched from CSIDC or generated as mock."""
+
+    __tablename__ = "allotment_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    area_name = Column(String(255), nullable=False, index=True)
+    plot_name = Column(String(255), nullable=True)
+    allottee = Column(String(255), nullable=True)
+    allotment_date = Column(DateTime, nullable=True)
+    construction_deadline = Column(DateTime, nullable=True)  # allotment_date + 2 years
+    plot_area_sqm = Column(Float, nullable=True)
+    category = Column(String(100), nullable=True)  # e.g. "industrial", "commercial"
+    status = Column(
+        String(100), nullable=True
+    )  # e.g. "allotted", "vacant", "constructed"
+    data_source = Column(
+        String(20), nullable=False, default="mock"
+    )  # "csidc" or "mock"
+    properties_json = Column(Text, nullable=True)  # raw CSIDC properties if available
+    created_at = Column(DateTime, default=utcnow)
+
+    @property
+    def properties(self):
+        if self.properties_json:
+            return json.loads(self.properties_json)
+        return {}
+
+
+class PlotCompliance(Base):
+    """Compliance check results for a detected plot."""
+
+    __tablename__ = "plot_compliance"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    plot_id = Column(Integer, ForeignKey("plots.id"), nullable=True)
+    area_name = Column(String(255), nullable=True)
+    plot_name = Column(String(255), nullable=True)
+
+    # Green cover compliance
+    green_cover_pct = Column(Float, nullable=True)  # 0.0 – 100.0
+    green_cover_threshold = Column(Float, default=20.0)  # minimum required %
+    is_green_compliant = Column(Boolean, nullable=True)
+
+    # Construction timeline compliance
+    allotment_date = Column(DateTime, nullable=True)
+    construction_deadline = Column(DateTime, nullable=True)
+    construction_started = Column(Boolean, nullable=True)
+    is_construction_compliant = Column(Boolean, nullable=True)
+
+    # Overall
+    is_compliant = Column(Boolean, nullable=True)  # True if ALL checks pass
+    violations_json = Column(Text, nullable=True)  # list of violation descriptions
+    data_source = Column(String(20), default="mock")  # "csidc" or "mock"
+
+    checked_at = Column(DateTime, default=utcnow)
+
+    @property
+    def violations(self):
+        if self.violations_json:
+            return json.loads(self.violations_json)
+        return []
+
+    @violations.setter
+    def violations(self, value):
+        self.violations_json = json.dumps(value) if value else None

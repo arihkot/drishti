@@ -53,6 +53,8 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
             remove_contained_polygons,
             clip_to_boundary,
             renumber_labels,
+            filter_noisy_polygons,
+            filter_unmatched_detected_plots,
         )
 
         t_start = time.time()
@@ -239,6 +241,13 @@ async def auto_detect(data: AutoDetectRequest, db: AsyncSession = Depends(get_db
                 f"Noise filter: dropped {noise_dropped} tiny features "
                 f"(<{NOISE_AREA_THRESHOLD_SQM} sqm), {len(plots_data)} remaining"
             )
+
+        # 4c-ii. Shape-based noise filter: drop distorted/implausible polygons
+        plots_data = filter_noisy_polygons(plots_data)
+
+        # 4c-iii. Unmatched detected plot filter: drop plots with no CSIDC ref
+        if csidc_plots:
+            plots_data = filter_unmatched_detected_plots(plots_data, csidc_plots)
 
         # 4d. Remove smaller polygons contained inside larger ones
         plots_data = remove_contained_polygons(plots_data)

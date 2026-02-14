@@ -41,13 +41,22 @@ app.add_middleware(
 app.mount("/exports", StaticFiles(directory=str(settings.EXPORTS_DIR)), name="exports")
 
 # Import and include routers
-from backend.routers import areas, auth, comparison, detection, export, projects  # noqa: E402
+from backend.routers import (
+    areas,
+    auth,
+    comparison,
+    compliance,
+    detection,
+    export,
+    projects,
+)  # noqa: E402
 
 app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
 app.include_router(areas.router, prefix="/api/areas", tags=["Areas"])
 app.include_router(projects.router, prefix="/api/projects", tags=["Projects"])
 app.include_router(detection.router, prefix="/api/detect", tags=["Detection"])
 app.include_router(comparison.router, prefix="/api/compare", tags=["Comparison"])
+app.include_router(compliance.router, prefix="/api/compliance", tags=["Compliance"])
 app.include_router(export.router, prefix="/api/export", tags=["Export"])
 
 

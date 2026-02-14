@@ -647,6 +647,176 @@ def merge_small_nearby_polygons(
     return merged_plots
 
 
+def filter_noisy_polygons(
+    polygons: list[dict],
+    min_compactness: float = 0.08,
+    min_area_sqm: float = 80.0,
+    max_aspect_ratio: float = 12.0,
+) -> list[dict]:
+    """Remove noisy, distorted, or implausibly shaped polygons.
+
+    Applies three shape quality filters beyond the existing area threshold:
+
+    1. **Compactness** (Polsby-Popper score = 4*pi*area / perimeter^2).
+       A circle scores 1.0, a square ~0.785.  Very distorted slivers
+       score close to 0.  Polygons below min_compactness are dropped.
+
+    2. **Minimum area** — a stricter area threshold for non-road features.
+       Tiny "plot" detections under min_area_sqm are noise.
+
+    3. **Aspect ratio** — bounding box aspect ratio > max_aspect_ratio
+       is almost certainly a road fragment that wasn't classified as road.
+
+    Only 'plot' category polygons are filtered; roads and boundaries pass through.
+
+    Args:
+        polygons: List of plot dicts with 'geometry', 'area_sqm', 'category'.
+        min_compactness: Minimum Polsby-Popper score (0..1).
+        min_area_sqm: Minimum area for plot polygons.
+        max_aspect_ratio: Maximum bbox aspect ratio for plot polygons.
+
+    Returns:
+        Filtered list of plot dicts.
+    """
+    if not polygons:
+        return polygons
+
+    kept = []
+    dropped_compactness = 0
+    dropped_area = 0
+    dropped_aspect = 0
+
+    for p in polygons:
+        category = p.get("category", "plot")
+
+        # Only filter 'plot' category — roads/boundaries pass through
+        if category != "plot":
+            kept.append(p)
+            continue
+
+        area_sqm = p.get("area_sqm", 0)
+        if area_sqm < min_area_sqm:
+            dropped_area += 1
+            continue
+
+        try:
+            geom = shape(p["geometry"])
+            if not geom.is_valid:
+                geom = make_valid(geom)
+
+            # Compactness check (Polsby-Popper)
+            perimeter = geom.length
+            if perimeter > 0:
+                compactness = (4.0 * math.pi * geom.area) / (perimeter**2)
+            else:
+                compactness = 0.0
+
+            if compactness < min_compactness:
+                dropped_compactness += 1
+                continue
+
+            # Aspect ratio check
+            aspect = _shape_aspect(geom)
+            if aspect > max_aspect_ratio:
+                dropped_aspect += 1
+                continue
+
+        except Exception:
+            pass  # If we can't analyse the shape, keep it
+
+        kept.append(p)
+
+    total_dropped = dropped_compactness + dropped_area + dropped_aspect
+    if total_dropped > 0:
+        logger.info(
+            f"Noise filter: dropped {total_dropped} distorted polygons "
+            f"(compactness={dropped_compactness}, area={dropped_area}, "
+            f"aspect={dropped_aspect}), {len(kept)} retained"
+        )
+
+    return kept
+
+
+def filter_unmatched_detected_plots(
+    detected_plots: list[dict],
+    csidc_plots: list[dict],
+    overlap_threshold: float = 0.10,
+) -> list[dict]:
+    """Remove detected plots that have no matching CSIDC reference plot.
+
+    A detected plot is kept if it overlaps with at least one CSIDC
+    reference plot by >= overlap_threshold of the detected plot's area.
+    Plots from the 'csidc_reference' source are always kept.
+
+    Args:
+        detected_plots: List of detected plot dicts.
+        csidc_plots: List of CSIDC reference plot dicts with 'geometry'.
+        overlap_threshold: Minimum overlap ratio to consider a match.
+
+    Returns:
+        Filtered list of detected plots.
+    """
+    if not csidc_plots or not detected_plots:
+        return detected_plots
+
+    # Build union of all CSIDC reference geometries
+    ref_geoms = []
+    for cp in csidc_plots:
+        try:
+            geom = cp.get("geometry")
+            if not geom:
+                continue
+            g = shape(geom)
+            if not g.is_valid:
+                g = make_valid(g)
+            ref_geoms.append(g)
+        except Exception:
+            continue
+
+    if not ref_geoms:
+        return detected_plots
+
+    ref_union = unary_union(ref_geoms)
+
+    kept = []
+    dropped = 0
+
+    for p in detected_plots:
+        # Always keep non-plot features (roads, boundaries)
+        category = p.get("category", "plot")
+        if category != "plot":
+            kept.append(p)
+            continue
+
+        # Always keep injected CSIDC reference plots
+        if p.get("source") == "csidc_reference":
+            kept.append(p)
+            continue
+
+        try:
+            geom = shape(p["geometry"])
+            if not geom.is_valid:
+                geom = make_valid(geom)
+
+            intersection = geom.intersection(ref_union)
+            overlap_ratio = intersection.area / (geom.area + 1e-12)
+
+            if overlap_ratio >= overlap_threshold:
+                kept.append(p)
+            else:
+                dropped += 1
+        except Exception:
+            kept.append(p)  # keep on error
+
+    if dropped > 0:
+        logger.info(
+            f"Unmatched filter: dropped {dropped} detected plots with no "
+            f"CSIDC reference match, {len(kept)} retained"
+        )
+
+    return kept
+
+
 def inject_missing_csidc_plots(
     detected_plots: list[dict],
     csidc_plots: list[dict],

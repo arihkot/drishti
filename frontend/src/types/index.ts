@@ -1,3 +1,15 @@
+// ---- Notification types ----
+export interface AppNotification {
+  id: string;
+  type: "encroachment" | "compliance" | "boundary" | "alert";
+  severity: "low" | "medium" | "high" | "critical";
+  title: string;
+  message: string;
+  area: string;
+  timestamp: string;
+  read: boolean;
+}
+
 // ---- GeoJSON types ----
 export interface GeoJSONGeometry {
   type: string;
@@ -159,6 +171,7 @@ export interface CsidcReferencePlotProperties {
   allottee: string;
   area_sqm: number | null;
   status: string;
+  allotment_date: string;
   source: "csidc_reference";
   [key: string]: unknown;
 }
@@ -178,4 +191,59 @@ export interface CsidcReferencePlotsGeoJSON {
     total: number;
     source: string;
   };
+}
+
+// ---- Compliance types ----
+export interface PlotComplianceResult {
+  plot_id: number;
+  label: string;
+  matched_allotment_plot: string | null;
+  green_cover_pct: number | null;
+  is_green_compliant: boolean | null;
+  allotment_date: string | null;
+  construction_deadline: string | null;
+  construction_started: boolean | null;
+  is_construction_compliant: boolean | null;
+  is_compliant: boolean | null;
+  violations: string[];
+  data_source: "csidc" | "mock";
+}
+
+export interface ComplianceSummary {
+  total_plots: number;
+  green_cover: {
+    checked: number;
+    compliant: number;
+    non_compliant: number;
+    threshold_pct: number;
+  };
+  construction_timeline: {
+    checked: number;
+    compliant: number;
+    non_compliant: number;
+    deadline_years: number;
+  };
+  overall: {
+    fully_compliant: number;
+    non_compliant: number;
+    unchecked: number;
+  };
+  data_sources: {
+    csidc: number;
+    mock: number;
+  };
+}
+
+export interface ComplianceResponse {
+  project_id: number;
+  area_name: string | null;
+  total_plots: number;
+  results: PlotComplianceResult[];
+  summary: ComplianceSummary;
+}
+
+export interface ComplianceSummaryResponse {
+  project_id: number;
+  has_data: boolean;
+  summary: ComplianceSummary | null;
 }

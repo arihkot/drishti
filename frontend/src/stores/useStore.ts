@@ -4,14 +4,16 @@ import type {
   AreaBoundary,
   Project,
   ComparisonResult,
+  ComplianceResponse,
   WMSConfig,
   GeoJSONGeometry,
   CsidcReferencePlotsGeoJSON,
+  AppNotification,
 } from "../types";
 import * as api from "../api/client";
 
 type ViewMode = "satellite" | "schematic";
-type SidebarTab = "areas" | "plots" | "compare" | "export";
+type SidebarTab = "areas" | "plots" | "compare" | "compliance" | "export";
 
 interface AppState {
   // ---- Map ----
@@ -29,6 +31,10 @@ interface AppState {
   csidcReferencePlots: CsidcReferencePlotsGeoJSON | null;
   csidcRefLoading: boolean;
   loadCsidcReferencePlots: (areaName: string, category?: string) => Promise<void>;
+  updateCsidcReferencePlot: (
+    refId: number,
+    data: { allottee?: string; status?: string; allotment_date?: string }
+  ) => Promise<void>;
 
   // ---- Areas ----
   areas: IndustrialArea[];
@@ -86,6 +92,12 @@ interface AppState {
   runComparison: () => Promise<void>;
   loadComparison: () => Promise<void>;
 
+  // ---- Compliance ----
+  compliance: ComplianceResponse | null;
+  complianceLoading: boolean;
+  runComplianceCheck: () => Promise<void>;
+  loadCompliance: () => Promise<void>;
+
   // ---- Export ----
   exporting: boolean;
   exportPDF: () => Promise<void>;
@@ -102,6 +114,13 @@ interface AppState {
     type?: "success" | "error" | "info"
   ) => void;
   clearToast: () => void;
+
+  // ---- Notifications ----
+  notifications: AppNotification[];
+  initNotifications: () => void;
+  markNotificationRead: (id: string) => void;
+  markAllNotificationsRead: () => void;
+  dismissNotification: (id: string) => void;
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -140,6 +159,38 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       set({ csidcRefLoading: false });
       get().showToast(`Failed to load CSIDC reference plots: ${e}`, "error");
+    }
+  },
+  updateCsidcReferencePlot: async (refId, data) => {
+    try {
+      const result = await api.updateReferencePlot(refId, data);
+      // Update the feature in the local GeoJSON cache
+      const current = get().csidcReferencePlots;
+      if (current) {
+        const updatedFeatures = current.features.map((f) => {
+          if (f.properties.ref_id === refId) {
+            return {
+              ...f,
+              properties: {
+                ...f.properties,
+                allottee: result.allottee,
+                status: result.status,
+                allotment_date: result.allotment_date ?? "",
+              },
+            };
+          }
+          return f;
+        });
+        set({
+          csidcReferencePlots: {
+            ...current,
+            features: updatedFeatures,
+          },
+        });
+      }
+      get().showToast("Allotment details updated", "success");
+    } catch (e) {
+      get().showToast(`Failed to update allotment: ${e}`, "error");
     }
   },
   loadWMSConfig: async () => {
@@ -291,6 +342,8 @@ export const useStore = create<AppState>((set, get) => ({
       });
       set({ detectionProgress: "Detection complete!" });
       await get().loadProject(result.project_id);
+      // Auto-switch to CSIDC-only view after detection
+      set({ hideDetectedPlots: true, showCsidcReference: true });
       get().showToast(
         `Detected ${result.total} boundaries`,
         "success"
@@ -352,6 +405,33 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  // ---- Compliance ----
+  compliance: null,
+  complianceLoading: false,
+  runComplianceCheck: async () => {
+    const project = get().activeProject;
+    if (!project) return;
+    set({ complianceLoading: true });
+    try {
+      const result = await api.runCompliance(project.id);
+      set({ compliance: result, complianceLoading: false });
+      get().showToast("Compliance check complete", "success");
+    } catch (e) {
+      set({ complianceLoading: false });
+      get().showToast(`Compliance check failed: ${e}`, "error");
+    }
+  },
+  loadCompliance: async () => {
+    const project = get().activeProject;
+    if (!project) return;
+    try {
+      const result = await api.getCompliance(project.id);
+      set({ compliance: result });
+    } catch {
+      // No compliance data yet -- that's fine
+    }
+  },
+
   // ---- Export ----
   exporting: false,
   exportPDF: async () => {
@@ -409,4 +489,113 @@ export const useStore = create<AppState>((set, get) => ({
     }, 4000);
   },
   clearToast: () => set({ toast: null }),
+
+  // ---- Notifications ----
+  notifications: [],
+  initNotifications: () => {
+    // Only generate once
+    if (get().notifications.length > 0) return;
+
+    const areas = ["URLA", "SILTARA", "BHANPURI", "BORAI", "BHILAI", "BIRGAON", "SIRGITTI", "KORBA"];
+    const templates: Array<{
+      type: AppNotification["type"];
+      severity: AppNotification["severity"];
+      title: string;
+      messageFn: (area: string, plot: string) => string;
+    }> = [
+      {
+        type: "encroachment",
+        severity: "critical",
+        title: "Illegal Encroachment Detected",
+        messageFn: (area, plot) =>
+          `Unauthorized construction detected on plot ${plot} in ${area}. Satellite imagery shows ~245 sqm encroached area beyond allotted boundary.`,
+      },
+      {
+        type: "encroachment",
+        severity: "high",
+        title: "Boundary Violation Alert",
+        messageFn: (area, plot) =>
+          `Plot ${plot} in ${area} shows boundary deviation of 18.3m on the eastern side. Immediate inspection recommended.`,
+      },
+      {
+        type: "encroachment",
+        severity: "critical",
+        title: "Unauthorized Structure on Vacant Land",
+        messageFn: (area, plot) =>
+          `New structure detected on vacant plot ${plot} in ${area}. No allotment records found. Area: ~180 sqm.`,
+      },
+      {
+        type: "alert",
+        severity: "high",
+        title: "Repeated Encroachment Warning",
+        messageFn: (area, plot) =>
+          `Plot ${plot} in ${area} flagged for 3rd time in 6 months. Previous notices unresponded. Escalation required.`,
+      },
+      {
+        type: "boundary",
+        severity: "medium",
+        title: "Boundary Mismatch Detected",
+        messageFn: (area, plot) =>
+          `Detected boundary of plot ${plot} in ${area} differs from CSIDC records by 12.7%. Review needed.`,
+      },
+      {
+        type: "compliance",
+        severity: "high",
+        title: "Green Cover Non-Compliance",
+        messageFn: (area, plot) =>
+          `Plot ${plot} in ${area} has only 8% green cover, well below the 20% minimum threshold.`,
+      },
+      {
+        type: "encroachment",
+        severity: "medium",
+        title: "Road Encroachment Suspected",
+        messageFn: (area, plot) =>
+          `Possible encroachment onto internal road near plot ${plot} in ${area}. Satellite analysis shows 35 sqm overlap.`,
+      },
+      {
+        type: "compliance",
+        severity: "medium",
+        title: "Construction Deadline Approaching",
+        messageFn: (area, plot) =>
+          `Plot ${plot} in ${area} has 45 days remaining to commence construction per allotment terms.`,
+      },
+    ];
+
+    const now = Date.now();
+    const mockNotifications: AppNotification[] = templates.map((t, i) => {
+      const area = areas[i % areas.length];
+      const plotNum = `${area.slice(0, 2)}-${String(100 + Math.floor(Math.random() * 400)).padStart(3, "0")}`;
+      // Stagger times: most recent first, spaced 1-6 hours apart
+      const offsetMs = i * (1 + Math.random() * 5) * 3600_000;
+      return {
+        id: `notif-${i}`,
+        type: t.type,
+        severity: t.severity,
+        title: t.title,
+        message: t.messageFn(area, plotNum),
+        area,
+        timestamp: new Date(now - offsetMs).toISOString(),
+        read: false,
+      };
+    });
+
+    set({ notifications: mockNotifications });
+  },
+  markNotificationRead: (id) => {
+    set((s) => ({
+      notifications: s.notifications.map((n) =>
+        n.id === id ? { ...n, read: true } : n
+      ),
+    }));
+  },
+  markAllNotificationsRead: () => {
+    set((s) => ({
+      notifications: s.notifications.map((n) => ({ ...n, read: true })),
+    }));
+  },
+  dismissNotification: (id) => {
+    set((s) => ({
+      notifications: s.notifications.filter((n) => n.id !== id),
+    }));
+  },
 }));

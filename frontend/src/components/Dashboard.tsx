@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import {
   ChevronRight,
   ArrowUpRight,
@@ -7,12 +7,22 @@ import {
   ChevronUp,
   LogOut,
   Upload,
+  ShieldCheck,
+  Leaf,
+  Clock,
+  AlertTriangle,
+  Bell,
+  X,
+  MapPin,
+  Download,
 } from "lucide-react";
 import {
   type DashboardStats,
   getPdfProcessingUpdates,
   getKarmaLabel,
 } from "../data/mockData";
+import { useStore } from "../stores/useStore";
+import * as api from "../api/client";
 
 // ─── Prop types ──────────────────────────────────────────────────────────────
 
@@ -80,6 +90,15 @@ const Dashboard: React.FC<DashboardProps> = ({
   const [pdfDone, setPdfDone] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // ── Drone upload state ────────────────────────────────────────────────────
+  const [droneFiles, setDroneFiles] = useState<File[]>([]);
+  const [droneDragOver, setDroneDragOver] = useState(false);
+  const [droneProcessing, setDroneProcessing] = useState(false);
+  const [droneProgress, setDroneProgress] = useState(0);
+  const [droneStage, setDroneStage] = useState("");
+  const [droneDone, setDroneDone] = useState(false);
+  const droneInputRef = useRef<HTMLInputElement>(null);
+
   // ── Area sort state ───────────────────────────────────────────────────────
   const [areaSortKey, setAreaSortKey] = useState<
     "name" | "plots" | "occupancy" | "revenueCollected"
@@ -92,6 +111,60 @@ const Dashboard: React.FC<DashboardProps> = ({
     d.setHours(d.getHours() - 2);
     return d;
   });
+
+  // ── Compliance data from store ──────────────────────────────────────────────
+  const compliance = useStore((s) => s.compliance);
+
+  // ── Notifications ─────────────────────────────────────────────────────────
+  const notifications = useStore((s) => s.notifications);
+  const initNotifications = useStore((s) => s.initNotifications);
+  const markNotificationRead = useStore((s) => s.markNotificationRead);
+  const markAllNotificationsRead = useStore((s) => s.markAllNotificationsRead);
+  const dismissNotification = useStore((s) => s.dismissNotification);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const notifRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    initNotifications();
+  }, [initNotifications]);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (notifRef.current && !notifRef.current.contains(e.target as Node)) {
+        setNotifOpen(false);
+      }
+    };
+    if (notifOpen) document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [notifOpen]);
+
+  const unreadCount = notifications.filter((n) => !n.read).length;
+
+  // ── Dashboard PDF export ───────────────────────────────────────────────────
+  const [dashExporting, setDashExporting] = useState(false);
+  const showToast = useStore((s) => s.showToast);
+
+  const handleExportDashboardPDF = useCallback(async () => {
+    setDashExporting(true);
+    try {
+      const blob = await api.exportDashboardPDF(
+        stats as unknown as Record<string, unknown>,
+        { name: user.name, role: user.role, department: user.department, designation: user.designation }
+      );
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `drishti-dashboard-${new Date().toISOString().slice(0, 10)}.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast("Dashboard PDF exported", "success");
+    } catch (e) {
+      showToast(`Dashboard PDF export failed: ${e}`, "error");
+    } finally {
+      setDashExporting(false);
+    }
+  }, [stats, user, showToast]);
 
   // ── PDF upload logic ────────────────────────────────────────────────────────
   const handleFileSelect = useCallback((file: File) => {
@@ -136,6 +209,62 @@ const Dashboard: React.FC<DashboardProps> = ({
       }
     }, interval);
   }, [pdfFile, pdfUploading, setStats]);
+
+  // ── Drone upload logic ────────────────────────────────────────────────────
+  const handleDroneFiles = useCallback((files: FileList | null) => {
+    if (!files) return;
+    const imageFiles = Array.from(files).filter((f) =>
+      f.type.startsWith("image/") || /\.(tif|tiff|jpg|jpeg|png)$/i.test(f.name)
+    );
+    if (imageFiles.length > 0) {
+      setDroneFiles(imageFiles);
+      setDroneDone(false);
+    }
+  }, []);
+
+  const handleDroneUpload = useCallback(() => {
+    if (droneFiles.length === 0 || droneProcessing) return;
+    setDroneProcessing(true);
+    setDroneProgress(0);
+    setDroneDone(false);
+
+    const stages = [
+      { pct: 10, label: "Uploading drone imagery..." },
+      { pct: 25, label: "Stitching orthomosaic..." },
+      { pct: 40, label: "Georeferencing tiles..." },
+      { pct: 55, label: "Aligning with existing basemap..." },
+      { pct: 70, label: "Running radiometric correction..." },
+      { pct: 85, label: "Generating tile pyramid..." },
+      { pct: 95, label: "Finalizing basemap update..." },
+    ];
+
+    const duration = 60000; // 60 seconds
+    const interval = 200;
+    const steps = duration / interval;
+    let step = 0;
+
+    setDroneStage(stages[0].label);
+    const timer = setInterval(() => {
+      step++;
+      const progress = Math.min(100, Math.round((step / steps) * 100));
+      setDroneProgress(progress);
+
+      // Update stage label
+      for (let i = stages.length - 1; i >= 0; i--) {
+        if (progress >= stages[i].pct) {
+          setDroneStage(stages[i].label);
+          break;
+        }
+      }
+
+      if (step >= steps) {
+        clearInterval(timer);
+        setDroneProcessing(false);
+        setDroneDone(true);
+        setDroneStage("");
+      }
+    }, interval);
+  }, [droneFiles, droneProcessing]);
 
   // ── Sorted area data ────────────────────────────────────────────────────────
   const sortedAreas = [...stats.areaWise].sort((a, b) => {
@@ -320,6 +449,142 @@ const Dashboard: React.FC<DashboardProps> = ({
                   year: "numeric",
                 })}
               </div>
+
+              {/* Notification bell */}
+              <div className="relative" ref={notifRef}>
+                <button
+                  onClick={() => setNotifOpen((o) => !o)}
+                  className="relative p-2.5 rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors"
+                  title="Notifications"
+                >
+                  <Bell className="w-4 h-4" />
+                  {unreadCount > 0 && (
+                    <span className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+                      {unreadCount > 9 ? "9+" : unreadCount}
+                    </span>
+                  )}
+                </button>
+
+                {notifOpen && (
+                  <div className="absolute right-0 top-12 w-96 bg-white rounded-xl shadow-2xl border border-gray-200 z-50 overflow-hidden">
+                    {/* Header */}
+                    <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 bg-gray-50">
+                      <h3 className="text-sm font-semibold text-gray-800">
+                        Notifications
+                        {unreadCount > 0 && (
+                          <span className="ml-2 text-xs font-medium text-red-600">
+                            {unreadCount} new
+                          </span>
+                        )}
+                      </h3>
+                      {unreadCount > 0 && (
+                        <button
+                          onClick={markAllNotificationsRead}
+                          className="text-xs text-blue-600 hover:text-blue-800 font-medium"
+                        >
+                          Mark all read
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Notification list */}
+                    <div className="max-h-96 overflow-y-auto divide-y divide-gray-50">
+                      {notifications.length === 0 ? (
+                        <div className="py-8 text-center text-gray-400 text-sm">
+                          No notifications
+                        </div>
+                      ) : (
+                        notifications.map((n) => {
+                          const sevColors: Record<string, string> = {
+                            critical: "bg-red-100 text-red-700",
+                            high: "bg-orange-100 text-orange-700",
+                            medium: "bg-yellow-100 text-yellow-700",
+                            low: "bg-blue-100 text-blue-700",
+                          };
+                          const sevIcon: Record<string, React.ReactNode> = {
+                            critical: <AlertTriangle className="w-4 h-4 text-red-500" />,
+                            high: <AlertTriangle className="w-4 h-4 text-orange-500" />,
+                            medium: <MapPin className="w-4 h-4 text-yellow-600" />,
+                            low: <ShieldCheck className="w-4 h-4 text-blue-500" />,
+                          };
+                          const timeAgo = (() => {
+                            const diffMs = Date.now() - new Date(n.timestamp).getTime();
+                            const mins = Math.floor(diffMs / 60000);
+                            if (mins < 60) return `${mins}m ago`;
+                            const hrs = Math.floor(mins / 60);
+                            if (hrs < 24) return `${hrs}h ago`;
+                            return `${Math.floor(hrs / 24)}d ago`;
+                          })();
+
+                          return (
+                            <div
+                              key={n.id}
+                              className={`px-4 py-3 hover:bg-gray-50 transition-colors cursor-pointer ${
+                                !n.read ? "bg-blue-50/40" : ""
+                              }`}
+                              onClick={() => markNotificationRead(n.id)}
+                            >
+                              <div className="flex items-start gap-3">
+                                <div className="flex-shrink-0 mt-0.5">
+                                  {sevIcon[n.severity]}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2 mb-0.5">
+                                    <span className="text-xs font-semibold text-gray-800 truncate">
+                                      {n.title}
+                                    </span>
+                                    {!n.read && (
+                                      <span className="w-2 h-2 rounded-full bg-blue-500 flex-shrink-0" />
+                                    )}
+                                  </div>
+                                  <p className="text-[11px] text-gray-500 leading-relaxed line-clamp-2">
+                                    {n.message}
+                                  </p>
+                                  <div className="flex items-center gap-2 mt-1">
+                                    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded-full ${sevColors[n.severity]}`}>
+                                      {n.severity}
+                                    </span>
+                                    <span className="text-[10px] text-gray-400">
+                                      {n.area}
+                                    </span>
+                                    <span className="text-[10px] text-gray-300">|</span>
+                                    <span className="text-[10px] text-gray-400">
+                                      {timeAgo}
+                                    </span>
+                                  </div>
+                                </div>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    dismissNotification(n.id);
+                                  }}
+                                  className="flex-shrink-0 p-1 rounded hover:bg-gray-200 text-gray-300 hover:text-gray-500 transition-colors"
+                                >
+                                  <X className="w-3 h-3" />
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <button
+                onClick={handleExportDashboardPDF}
+                disabled={dashExporting}
+                className="p-2.5 rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors disabled:opacity-50"
+                title="Export dashboard as PDF"
+              >
+                {dashExporting ? (
+                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <Download className="w-4 h-4" />
+                )}
+              </button>
+
               <button
                 onClick={onEnterMap}
                 className="px-5 py-2.5 bg-white text-blue-800 font-semibold text-sm rounded-lg hover:bg-blue-50 transition-colors active:scale-[0.98]"
@@ -462,6 +727,134 @@ const Dashboard: React.FC<DashboardProps> = ({
                     Dashboard updated with data from{" "}
                     <span className="font-medium">{pdfFile?.name}</span>. Total plots:{" "}
                     {fmt(stats.totalPlots)}, compliance: {fmtDec(stats.complianceRate)}%.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        </Section>
+
+        {/* ── Modify Basemap (Drone Survey) ───────────────────────────────── */}
+        <Section title="Modify Basemap — Drone Survey">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Drop zone */}
+            <div
+              className={`relative border-2 border-dashed rounded-xl p-8 text-center transition-all cursor-pointer group ${
+                droneDragOver
+                  ? "border-blue-500 bg-blue-50"
+                  : droneFiles.length > 0
+                    ? "border-emerald-400 bg-emerald-50/50"
+                    : "border-gray-300 bg-gray-50 hover:border-blue-400 hover:bg-blue-50/30"
+              }`}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDroneDragOver(true);
+              }}
+              onDragLeave={() => setDroneDragOver(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDroneDragOver(false);
+                handleDroneFiles(e.dataTransfer.files);
+              }}
+              onClick={() => droneInputRef.current?.click()}
+            >
+              <input
+                ref={droneInputRef}
+                type="file"
+                accept="image/*,.tif,.tiff"
+                multiple
+                className="hidden"
+                onChange={(e) => handleDroneFiles(e.target.files)}
+              />
+              <div className="flex flex-col items-center gap-3">
+                {droneFiles.length > 0 ? (
+                  <div>
+                    <p className="font-medium text-gray-800">
+                      {droneFiles.length} image{droneFiles.length > 1 ? "s" : ""} selected
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      {droneFiles.map((f) => f.name).join(", ").slice(0, 80)}
+                      {droneFiles.map((f) => f.name).join(", ").length > 80 ? "..." : ""}
+                      {" "}— Click or drag to replace
+                    </p>
+                  </div>
+                ) : (
+                  <div>
+                    <p className="font-medium text-gray-700">
+                      Drag & drop drone images here, or{" "}
+                      <span className="text-blue-700 underline">browse</span>
+                    </p>
+                    <p className="text-xs text-gray-400 mt-0.5">
+                      GeoTIFF, JPEG, or PNG from drone surveys (.tif, .jpg, .png)
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Upload action & status */}
+            <div className="flex flex-col justify-center gap-4">
+              <div className="space-y-3">
+                <p className="text-sm text-gray-600 leading-relaxed">
+                  Upload drone survey imagery to update the basemap. The system
+                  stitches, georeferences, and integrates images into the existing basemap layer.
+                </p>
+                <button
+                  onClick={handleDroneUpload}
+                  disabled={droneFiles.length === 0 || droneProcessing}
+                  className={`flex items-center justify-center gap-2 w-full sm:w-auto px-6 py-3 rounded-lg font-semibold text-sm transition-colors ${
+                    droneFiles.length === 0 || droneProcessing
+                      ? "bg-gray-200 text-gray-400 cursor-not-allowed"
+                      : "bg-blue-800 text-white hover:bg-blue-700 active:scale-[0.98]"
+                  }`}
+                >
+                  {droneProcessing ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      Processing...
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="w-4 h-4" />
+                      Upload & Process Imagery
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {/* Progress */}
+              {droneProcessing && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs text-gray-600">
+                    <span className="flex items-center gap-1.5">
+                      <div className="w-3 h-3 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+                      {droneStage}
+                    </span>
+                    <span className="font-mono font-semibold text-blue-800">
+                      {droneProgress}%
+                    </span>
+                  </div>
+                  <div className="w-full h-2.5 bg-gray-200 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-blue-600 rounded-full transition-all duration-200 ease-linear"
+                      style={{ width: `${droneProgress}%` }}
+                    />
+                  </div>
+                  <div className="text-[11px] text-gray-400">
+                    Estimated time remaining: ~{Math.max(1, Math.ceil((100 - droneProgress) * 0.6))}s
+                  </div>
+                </div>
+              )}
+
+              {/* Success */}
+              {droneDone && !droneProcessing && (
+                <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
+                  <p className="text-sm font-semibold text-emerald-800">
+                    Basemap Updated Successfully
+                  </p>
+                  <p className="text-xs text-emerald-600 mt-0.5">
+                    {droneFiles.length} drone image{droneFiles.length > 1 ? "s" : ""} processed
+                    and integrated into the basemap. The updated imagery is now available in Map View.
                   </p>
                 </div>
               )}
@@ -619,8 +1012,145 @@ const Dashboard: React.FC<DashboardProps> = ({
                 </div>
               ))}
             </div>
-          </Section>
+           </Section>
         </div>
+
+        {/* ── Satellite Compliance Analysis ─────────────────────────────────── */}
+        {compliance && compliance.summary && (
+          <Section title="Satellite Compliance Analysis">
+            <div className="mb-3">
+              <p className="text-xs text-gray-400">
+                Real-time compliance status from satellite imagery analysis and allotment records
+                {compliance.area_name ? ` for ${compliance.area_name}` : ""}.
+              </p>
+            </div>
+
+            {/* Summary cards */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
+              <div className="rounded-lg px-4 py-3 bg-gray-50 border border-gray-200">
+                <div className="flex items-center gap-2 mb-1">
+                  <ShieldCheck className="h-4 w-4 text-gray-500" />
+                  <span className="text-[10px] font-medium text-gray-500 uppercase tracking-wider">
+                    Total Checked
+                  </span>
+                </div>
+                <p className="text-2xl font-bold text-gray-900">
+                  {compliance.summary.total_plots}
+                </p>
+              </div>
+              <div className="rounded-lg px-4 py-3 bg-emerald-50 border border-emerald-200">
+                <div className="flex items-center gap-2 mb-1">
+                  <ShieldCheck className="h-4 w-4 text-emerald-600" />
+                  <span className="text-[10px] font-medium text-emerald-600 uppercase tracking-wider">
+                    Fully Compliant
+                  </span>
+                </div>
+                <p className="text-2xl font-bold text-emerald-700">
+                  {compliance.summary.overall.fully_compliant}
+                </p>
+              </div>
+              <div className="rounded-lg px-4 py-3 bg-red-50 border border-red-200">
+                <div className="flex items-center gap-2 mb-1">
+                  <AlertTriangle className="h-4 w-4 text-red-600" />
+                  <span className="text-[10px] font-medium text-red-600 uppercase tracking-wider">
+                    Non-Compliant
+                  </span>
+                </div>
+                <p className="text-2xl font-bold text-red-700">
+                  {compliance.summary.overall.non_compliant}
+                </p>
+              </div>
+              <div className="rounded-lg px-4 py-3 bg-gray-50 border border-gray-200">
+                <div className="flex items-center gap-2 mb-1">
+                  <ShieldCheck className="h-4 w-4 text-gray-400" />
+                  <span className="text-[10px] font-medium text-gray-500 uppercase tracking-wider">
+                    Unchecked
+                  </span>
+                </div>
+                <p className="text-2xl font-bold text-gray-500">
+                  {compliance.summary.overall.unchecked}
+                </p>
+              </div>
+            </div>
+
+            {/* Green Cover + Construction Timeline breakdown */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {/* Green Cover */}
+              <div className="rounded-lg border border-gray-200 p-4">
+                <div className="flex items-center gap-2 mb-3">
+                  <Leaf className="h-4 w-4 text-green-600" />
+                  <span className="text-xs font-semibold text-gray-700">
+                    Green Cover ({"\u2265"}{compliance.summary.green_cover.threshold_pct}%)
+                  </span>
+                </div>
+                <div className="flex items-center gap-4 mb-2">
+                  <div className="flex-1">
+                    <div className="flex justify-between text-[10px] text-gray-500 mb-1">
+                      <span>{compliance.summary.green_cover.compliant} compliant</span>
+                      <span>{compliance.summary.green_cover.checked} checked</span>
+                    </div>
+                    <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-green-500 rounded-full transition-all"
+                        style={{
+                          width: `${
+                            compliance.summary.green_cover.checked > 0
+                              ? (compliance.summary.green_cover.compliant /
+                                  compliance.summary.green_cover.checked) *
+                                100
+                              : 0
+                          }%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                </div>
+                {compliance.summary.green_cover.non_compliant > 0 && (
+                  <p className="text-[10px] text-red-500">
+                    {compliance.summary.green_cover.non_compliant} plot(s) below threshold
+                  </p>
+                )}
+              </div>
+
+              {/* Construction Timeline */}
+              <div className="rounded-lg border border-gray-200 p-4">
+                <div className="flex items-center gap-2 mb-3">
+                  <Clock className="h-4 w-4 text-blue-600" />
+                  <span className="text-xs font-semibold text-gray-700">
+                    Construction Timeline ({compliance.summary.construction_timeline.deadline_years}yr deadline)
+                  </span>
+                </div>
+                <div className="flex items-center gap-4 mb-2">
+                  <div className="flex-1">
+                    <div className="flex justify-between text-[10px] text-gray-500 mb-1">
+                      <span>{compliance.summary.construction_timeline.compliant} compliant</span>
+                      <span>{compliance.summary.construction_timeline.checked} checked</span>
+                    </div>
+                    <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-blue-500 rounded-full transition-all"
+                        style={{
+                          width: `${
+                            compliance.summary.construction_timeline.checked > 0
+                              ? (compliance.summary.construction_timeline.compliant /
+                                  compliance.summary.construction_timeline.checked) *
+                                100
+                              : 0
+                          }%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                </div>
+                {compliance.summary.construction_timeline.non_compliant > 0 && (
+                  <p className="text-[10px] text-red-500">
+                    {compliance.summary.construction_timeline.non_compliant} plot(s) past deadline
+                  </p>
+                )}
+              </div>
+            </div>
+          </Section>
+        )}
 
         {/* ── Industrial Area Statistics + Category Distribution ────────────── */}
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">

@@ -14,6 +14,12 @@ import {
   Move,
   Save,
   X,
+  ShieldCheck,
+  Leaf,
+  Clock,
+  AlertTriangle,
+  CheckCircle2,
+  XCircle,
 } from "lucide-react";
 import { useStore } from "../stores/useStore";
 
@@ -36,6 +42,7 @@ const TABS = [
   { key: "areas" as const, icon: Map, label: "Browse Industrial Areas" },
   { key: "plots" as const, icon: Layers, label: "Detected Plots" },
   { key: "compare" as const, icon: GitCompare, label: "Comparison" },
+  { key: "compliance" as const, icon: ShieldCheck, label: "Compliance" },
   { key: "export" as const, icon: Download, label: "Export" },
 ];
 
@@ -623,6 +630,276 @@ const SummaryCard: React.FC<{
 );
 
 /* ------------------------------------------------------------------ */
+/*  Compliance Panel                                                   */
+/* ------------------------------------------------------------------ */
+const COMPLIANCE_BADGE: Record<string, string> = {
+  compliant: "bg-green-100 text-green-700",
+  non_compliant: "bg-red-100 text-red-700",
+  unchecked: "bg-gray-100 text-gray-500",
+};
+
+const CompliancePanel: React.FC = () => {
+  const {
+    activeProject,
+    compliance,
+    complianceLoading,
+    runComplianceCheck,
+    loadCompliance,
+  } = useStore();
+
+  useEffect(() => {
+    if (activeProject && !compliance) {
+      loadCompliance();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.id]);
+
+  const hasPlots =
+    activeProject && activeProject.plots && activeProject.plots.length > 0;
+  const canRun = !!activeProject && !!hasPlots && !complianceLoading;
+
+  const summary = compliance?.summary;
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Run button */}
+      <div className="p-3 border-b border-gray-200">
+        <button
+          disabled={!canRun}
+          onClick={runComplianceCheck}
+          className="w-full flex items-center justify-center gap-2 px-3 py-2.5 text-sm font-medium text-white bg-emerald-600 rounded-md hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {complianceLoading ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Running Checks...
+            </>
+          ) : (
+            <>
+              <ShieldCheck className="h-4 w-4" />
+              Run Compliance Check
+            </>
+          )}
+        </button>
+        {!activeProject && (
+          <p className="text-xs text-gray-400 mt-2 text-center">
+            No active project. Run detection first.
+          </p>
+        )}
+        {activeProject && !hasPlots && (
+          <p className="text-xs text-gray-400 mt-2 text-center">
+            No plots detected yet. Run detection first.
+          </p>
+        )}
+      </div>
+
+      {/* Results */}
+      {summary && compliance && (
+        <div className="flex-1 overflow-y-auto custom-scrollbar">
+          {/* Overall summary */}
+          <div className="p-3 border-b border-gray-200">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
+              Overall Compliance
+            </p>
+            <div className="grid grid-cols-3 gap-2">
+              <div className="rounded-lg px-3 py-2 bg-green-100 text-green-800">
+                <p className="text-[10px] font-medium opacity-70">Compliant</p>
+                <p className="text-lg font-bold">{summary.overall.fully_compliant}</p>
+              </div>
+              <div className="rounded-lg px-3 py-2 bg-red-100 text-red-800">
+                <p className="text-[10px] font-medium opacity-70">Violations</p>
+                <p className="text-lg font-bold">{summary.overall.non_compliant}</p>
+              </div>
+              <div className="rounded-lg px-3 py-2 bg-gray-100 text-gray-700">
+                <p className="text-[10px] font-medium opacity-70">Unchecked</p>
+                <p className="text-lg font-bold">{summary.overall.unchecked}</p>
+              </div>
+            </div>
+          </div>
+
+          {/* Green cover */}
+          <div className="p-3 border-b border-gray-200">
+            <div className="flex items-center gap-2 mb-2">
+              <Leaf className="h-3.5 w-3.5 text-green-600" />
+              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                Green Cover (min {summary.green_cover.threshold_pct}%)
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-lg px-3 py-2 bg-green-50 text-green-800">
+                <div className="flex items-center gap-1">
+                  <CheckCircle2 className="h-3 w-3" />
+                  <p className="text-[10px] font-medium">Compliant</p>
+                </div>
+                <p className="text-lg font-bold">{summary.green_cover.compliant}</p>
+              </div>
+              <div className="rounded-lg px-3 py-2 bg-red-50 text-red-800">
+                <div className="flex items-center gap-1">
+                  <XCircle className="h-3 w-3" />
+                  <p className="text-[10px] font-medium">Non-compliant</p>
+                </div>
+                <p className="text-lg font-bold">{summary.green_cover.non_compliant}</p>
+              </div>
+            </div>
+            <p className="text-[10px] text-gray-400 mt-1">
+              {summary.green_cover.checked} of {summary.total_plots} plots checked
+            </p>
+          </div>
+
+          {/* Construction timeline */}
+          <div className="p-3 border-b border-gray-200">
+            <div className="flex items-center gap-2 mb-2">
+              <Clock className="h-3.5 w-3.5 text-orange-600" />
+              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                Construction Timeline ({summary.construction_timeline.deadline_years}yr)
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-lg px-3 py-2 bg-green-50 text-green-800">
+                <div className="flex items-center gap-1">
+                  <CheckCircle2 className="h-3 w-3" />
+                  <p className="text-[10px] font-medium">On time</p>
+                </div>
+                <p className="text-lg font-bold">{summary.construction_timeline.compliant}</p>
+              </div>
+              <div className="rounded-lg px-3 py-2 bg-orange-50 text-orange-800">
+                <div className="flex items-center gap-1">
+                  <AlertTriangle className="h-3 w-3" />
+                  <p className="text-[10px] font-medium">Overdue</p>
+                </div>
+                <p className="text-lg font-bold">{summary.construction_timeline.non_compliant}</p>
+              </div>
+            </div>
+            <p className="text-[10px] text-gray-400 mt-1">
+              {summary.construction_timeline.checked} of {summary.total_plots} plots checked
+            </p>
+          </div>
+
+          {/* Per-plot results */}
+          <div className="p-3">
+            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
+              Per-Plot Results ({compliance.results.length})
+            </p>
+            {compliance.results.length === 0 ? (
+              <p className="text-sm text-gray-400 text-center py-4">
+                No results.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {compliance.results.map((r) => {
+                  const status = r.is_compliant === true
+                    ? "compliant"
+                    : r.is_compliant === false
+                    ? "non_compliant"
+                    : "unchecked";
+                  return (
+                    <div
+                      key={r.plot_id}
+                      className="rounded-lg border border-gray-200 p-2.5"
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <p className="text-sm font-medium text-gray-800 truncate">
+                          {r.label}
+                        </p>
+                        <span
+                          className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full whitespace-nowrap ${
+                            COMPLIANCE_BADGE[status]
+                          }`}
+                        >
+                          {status === "compliant"
+                            ? "Compliant"
+                            : status === "non_compliant"
+                            ? "Violation"
+                            : "Unchecked"}
+                        </span>
+                      </div>
+
+                      {/* Green cover bar */}
+                      {r.green_cover_pct != null && (
+                        <div className="mb-1">
+                          <div className="flex items-center justify-between text-[10px] text-gray-500 mb-0.5">
+                            <span>Green cover</span>
+                            <span
+                              className={
+                                r.is_green_compliant
+                                  ? "text-green-600 font-medium"
+                                  : "text-red-600 font-medium"
+                              }
+                            >
+                              {r.green_cover_pct.toFixed(1)}%
+                            </span>
+                          </div>
+                          <div className="w-full h-1.5 rounded-full bg-gray-200">
+                            <div
+                              className={`h-1.5 rounded-full ${
+                                r.is_green_compliant
+                                  ? "bg-green-500"
+                                  : "bg-red-500"
+                              }`}
+                              style={{
+                                width: `${Math.min(100, r.green_cover_pct)}%`,
+                              }}
+                            />
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Construction timeline */}
+                      {r.construction_deadline && (
+                        <div className="flex items-center gap-1 text-[10px] text-gray-500">
+                          <Clock className="h-3 w-3" />
+                          <span>
+                            Deadline:{" "}
+                            {new Date(r.construction_deadline).toLocaleDateString()}
+                          </span>
+                          {r.is_construction_compliant === true && (
+                            <CheckCircle2 className="h-3 w-3 text-green-500 ml-auto" />
+                          )}
+                          {r.is_construction_compliant === false && (
+                            <AlertTriangle className="h-3 w-3 text-orange-500 ml-auto" />
+                          )}
+                        </div>
+                      )}
+
+                      {/* Violations */}
+                      {r.violations.length > 0 && (
+                        <div className="mt-1.5 space-y-0.5">
+                          {r.violations.map((v, i) => (
+                            <div
+                              key={i}
+                              className="flex items-start gap-1 text-[10px] text-red-600"
+                            >
+                              <XCircle className="h-3 w-3 flex-shrink-0 mt-0.5" />
+                              <span>{v}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!compliance && !complianceLoading && (
+        <div className="flex flex-col items-center justify-center flex-1 text-gray-400 px-6">
+          <ShieldCheck className="h-10 w-10 mb-3" />
+          <p className="text-xs text-center">
+            Run a compliance check to evaluate green cover and construction
+            timeline for detected plots.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
 /*  Export Panel                                                      */
 /* ------------------------------------------------------------------ */
 const ExportPanel: React.FC = () => {
@@ -701,7 +978,7 @@ const Sidebar: React.FC<SidebarProps> = ({ onViewArea }) => {
   const { sidebarTab, setSidebarTab } = useStore();
 
   return (
-    <div className="w-80 h-full flex flex-col bg-white shadow-lg border-r border-gray-200">
+    <div className="w-96 h-full flex flex-col bg-white shadow-lg border-r border-gray-200">
       {/* Tab bar */}
       <div className="flex border-b border-gray-200">
         {TABS.map((tab) => {
@@ -730,6 +1007,7 @@ const Sidebar: React.FC<SidebarProps> = ({ onViewArea }) => {
         {sidebarTab === "areas" && <AreasPanel onViewArea={onViewArea} />}
         {sidebarTab === "plots" && <PlotsPanel />}
         {sidebarTab === "compare" && <ComparePanel />}
+        {sidebarTab === "compliance" && <CompliancePanel />}
         {sidebarTab === "export" && <ExportPanel />}
       </div>
     </div>

@@ -12,6 +12,8 @@ import type {
   GeoJSONFeatureCollection,
   GeoJSONGeometry,
   CsidcReferencePlotsGeoJSON,
+  ComplianceResponse,
+  ComplianceSummaryResponse,
 } from "../types";
 
 const BASE = "";
@@ -66,6 +68,23 @@ export async function fetchReferencePlotsGeoJSON(
   return request(
     `/api/areas/${encodeURIComponent(areaName)}/reference-plots/geojson?category=${category}`
   );
+}
+
+export async function updateReferencePlot(
+  plotId: number,
+  data: { allottee?: string; status?: string; allotment_date?: string }
+): Promise<{
+  ref_id: number;
+  name: string;
+  allottee: string;
+  status: string;
+  allotment_date: string | null;
+  area_name: string;
+}> {
+  return request(`/api/areas/reference-plots/${plotId}`, {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
 }
 
 // ---- Projects ----
@@ -183,4 +202,44 @@ export async function exportGeoJSON(
   projectId: number
 ): Promise<GeoJSONFeatureCollection> {
   return request(`/api/export/${projectId}/geojson`, { method: "POST" });
+}
+
+// ---- Compliance ----
+export async function runCompliance(
+  projectId: number,
+  options?: {
+    include_green_cover?: boolean;
+    include_construction_timeline?: boolean;
+  }
+): Promise<ComplianceResponse> {
+  return request(`/api/compliance/${projectId}`, {
+    method: "POST",
+    body: JSON.stringify(options ?? {}),
+  });
+}
+
+export async function getCompliance(
+  projectId: number
+): Promise<ComplianceResponse> {
+  return request(`/api/compliance/${projectId}`);
+}
+
+export async function getComplianceSummary(
+  projectId: number
+): Promise<ComplianceSummaryResponse> {
+  return request(`/api/compliance/${projectId}/summary`);
+}
+
+// ---- Dashboard Export ----
+export async function exportDashboardPDF(
+  stats: Record<string, unknown>,
+  user?: { name: string; role: string; department: string; designation: string }
+): Promise<Blob> {
+  const res = await fetch(`${BASE}/api/export/dashboard/pdf`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stats, user }),
+  });
+  if (!res.ok) throw new Error(`Dashboard PDF export failed: ${res.status}`);
+  return res.blob();
 }

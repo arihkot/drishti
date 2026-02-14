@@ -103,6 +103,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
     category: string;
     color: string;
     source?: "detected" | "csidc_reference";
+    ref_id?: number;
     allottee?: string;
     area_sqm?: number | null;
     area_sqft?: number | null;
@@ -113,6 +114,16 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
     location?: string;
     district?: string;
   } | null>(null);
+
+  // CSIDC reference plot edit modal state
+  const [editingRefPlot, setEditingRefPlot] = useState<{
+    ref_id: number;
+    name: string;
+    allottee: string;
+    status: string;
+    allotment_date: string;
+  } | null>(null);
+  const updateCsidcReferencePlot = useStore((s) => s.updateCsidcReferencePlot);
 
   // Store slices
   const viewMode = useStore((s) => s.viewMode);
@@ -184,7 +195,7 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
     const csidcRefLayer = new TileLayer({
       source: csidcRefSource,
       visible: false,
-      opacity: 0.55,
+      opacity: 0,
     });
 
     // CSIDC reference vector layer — for hover/tooltip interaction
@@ -192,14 +203,44 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
     const csidcRefVectorLayer = new VectorLayer({
       source: csidcRefVectorSource,
       visible: false,
-      style: new Style({
-        fill: new Fill({ color: "rgba(34, 197, 94, 0.12)" }),
-        stroke: new Stroke({
-          color: "#16a34a",
-          width: 1.5,
-          lineDash: [6, 3],
-        }),
-      }),
+      style: (feature) => {
+        const status = (feature.get("status") || "").toString().toUpperCase();
+        let strokeColor: string;
+        let fillColor: string;
+        switch (status) {
+          case "ALLOTTED":
+            strokeColor = "#dc2626";
+            fillColor = "rgba(220, 38, 38, 0.30)";
+            break;
+          case "AVAILABLE":
+            strokeColor = "#16a34a";
+            fillColor = "rgba(34, 197, 94, 0.30)";
+            break;
+          case "CANCELLED":
+            strokeColor = "#9ca3af";
+            fillColor = "rgba(156, 163, 175, 0.30)";
+            break;
+          case "DISPUTED":
+            strokeColor = "#f97316";
+            fillColor = "rgba(249, 115, 22, 0.30)";
+            break;
+          case "UNDER REVIEW":
+            strokeColor = "#eab308";
+            fillColor = "rgba(234, 179, 8, 0.30)";
+            break;
+          default:
+            strokeColor = "#16a34a";
+            fillColor = "rgba(34, 197, 94, 0.30)";
+            break;
+        }
+        return new Style({
+          fill: new Fill({ color: fillColor }),
+          stroke: new Stroke({
+            color: strokeColor,
+            width: 2,
+          }),
+        });
+      },
     });
 
     const deviationSource = new VectorSource<Feature<Geometry>>();
@@ -685,28 +726,54 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
 
       // Normal mode: try to select a plot feature
       const plotLayer = plotLayerRef.current;
-      if (!plotLayer) return;
+      const csidcRefVectorLayer = csidcRefVectorLayerRef.current;
 
       let hit = false;
-      map.forEachFeatureAtPixel(
-        evt.pixel,
-        (feature) => {
-          if (hit) return;
-          const id = feature.getId();
-          if (id != null) {
-            selectPlot(id as number);
-            hit = true;
-          }
-        },
-        { layerFilter: (l) => l === plotLayer }
-      );
+
+      // 1. Try detected plot layer first (unless hidden)
+      if (plotLayer && !hideDetectedPlots) {
+        map.forEachFeatureAtPixel(
+          evt.pixel,
+          (feature) => {
+            if (hit) return;
+            const id = feature.getId();
+            if (id != null) {
+              selectPlot(id as number);
+              hit = true;
+            }
+          },
+          { layerFilter: (l) => l === plotLayer }
+        );
+      }
+
+      // 2. Try CSIDC reference vector layer — open edit modal
+      if (!hit && csidcRefVectorLayer && csidcRefVectorLayer.getVisible()) {
+        map.forEachFeatureAtPixel(
+          evt.pixel,
+          (feature) => {
+            if (hit) return;
+            const props = (feature as Feature).getProperties();
+            if (props.ref_id) {
+              setEditingRefPlot({
+                ref_id: props.ref_id,
+                name: props.name || "Unknown Plot",
+                allottee: props.allottee || "",
+                status: props.status || "",
+                allotment_date: props.allotment_date || "",
+              });
+              hit = true;
+            }
+          },
+          { layerFilter: (l) => l === csidcRefVectorLayer, hitTolerance: 2 }
+        );
+      }
 
       // Click on empty space deselects
       if (!hit) {
         selectPlot(null);
       }
     },
-    [promptMode, selectPlot, runPromptDetect, editingPlotId]
+    [promptMode, selectPlot, runPromptDetect, editingPlotId, hideDetectedPlots]
   );
 
   useEffect(() => {
@@ -773,11 +840,20 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
           e.pixel,
           (feature) => {
             const props = (feature as Feature).getProperties();
+            const status = (props.status || "").toString().toUpperCase();
+            const csidcColor =
+              status === "ALLOTTED" ? "#dc2626" :
+              status === "AVAILABLE" ? "#16a34a" :
+              status === "CANCELLED" ? "#9ca3af" :
+              status === "DISPUTED" ? "#f97316" :
+              status === "UNDER REVIEW" ? "#eab308" :
+              "#16a34a";
             setHoverInfo({
               label: props.name || "Unknown Plot",
               category: "CSIDC Reference",
-              color: "#16a34a",
+              color: csidcColor,
               source: "csidc_reference",
+              ref_id: props.ref_id ?? undefined,
               allottee: props.allottee || undefined,
               area_sqm: props.area_sqm ?? null,
               status: props.status || undefined,
@@ -1034,6 +1110,101 @@ const MapView: React.FC<MapViewProps> = ({ promptMode, onMapReady }) => {
       />
       {/* Portal popup content into the OL overlay element */}
       {popupElRef.current && createPortal(popupContent, popupElRef.current)}
+
+      {/* CSIDC Reference Plot Edit Modal */}
+      {editingRefPlot && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+            {/* Header */}
+            <div className="px-6 py-4 bg-blue-800 text-white">
+              <h3 className="text-sm font-semibold">Edit Allotment Details</h3>
+              <p className="text-xs text-blue-200 mt-0.5">{editingRefPlot.name}</p>
+            </div>
+
+            {/* Form */}
+            <div className="px-6 py-5 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">
+                  Allottee Name
+                </label>
+                <input
+                  type="text"
+                  value={editingRefPlot.allottee}
+                  onChange={(e) =>
+                    setEditingRefPlot((prev) =>
+                      prev ? { ...prev, allottee: e.target.value } : null
+                    )
+                  }
+                  className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  placeholder="Enter allottee name"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">
+                  Allotment Status
+                </label>
+                <select
+                  value={editingRefPlot.status}
+                  onChange={(e) =>
+                    setEditingRefPlot((prev) =>
+                      prev ? { ...prev, status: e.target.value } : null
+                    )
+                  }
+                  className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white"
+                >
+                  <option value="">Select status</option>
+                  <option value="ALLOTTED">Allotted</option>
+                  <option value="AVAILABLE">Available</option>
+                  <option value="CANCELLED">Cancelled</option>
+                  <option value="DISPUTED">Disputed</option>
+                  <option value="UNDER REVIEW">Under Review</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">
+                  Date of Allotment
+                </label>
+                <input
+                  type="date"
+                  value={editingRefPlot.allotment_date}
+                  onChange={(e) =>
+                    setEditingRefPlot((prev) =>
+                      prev ? { ...prev, allotment_date: e.target.value } : null
+                    )
+                  }
+                  className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                />
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="px-6 py-3 bg-gray-50 border-t border-gray-200 flex items-center justify-end gap-3">
+              <button
+                onClick={() => setEditingRefPlot(null)}
+                className="px-4 py-2 text-sm font-medium text-gray-600 hover:text-gray-800 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  if (!editingRefPlot) return;
+                  await updateCsidcReferencePlot(editingRefPlot.ref_id, {
+                    allottee: editingRefPlot.allottee || undefined,
+                    status: editingRefPlot.status || undefined,
+                    allotment_date: editingRefPlot.allotment_date || undefined,
+                  });
+                  setEditingRefPlot(null);
+                }}
+                className="px-5 py-2 text-sm font-semibold text-white bg-blue-700 rounded-lg hover:bg-blue-800 transition-colors active:scale-[0.98]"
+              >
+                Save Changes
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 };

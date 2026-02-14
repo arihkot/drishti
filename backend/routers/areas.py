@@ -7,6 +7,7 @@ import logging
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -521,6 +522,7 @@ async def get_reference_plots_geojson(
             or props.get("district_i")
             or ""
         )
+        allotment_date = props.get("allotment_date") or ""
         features.append(
             {
                 "type": "Feature",
@@ -531,10 +533,11 @@ async def get_reference_plots_geojson(
                     "name": str(plot_name),
                     "allottee": str(allottee),
                     "area_sqm": float(area_val) if area_val else None,
-                    "status": str(status),
+                    "status": _normalize_status(str(status)),
                     "plot_type": str(plot_type),
                     "location": str(location),
                     "district": str(district),
+                    "allotment_date": str(allotment_date),
                     "source": "csidc_reference",
                 },
             }
@@ -548,6 +551,108 @@ async def get_reference_plots_geojson(
             "total": len(features),
             "source": "cache" if cached else "csidc",
         },
+    }
+
+
+def _normalize_status(raw: str) -> str:
+    """Map raw CSIDC status values to canonical display labels."""
+    low = raw.strip().lower()
+    if not low:
+        return "AVAILABLE"
+    if low.startswith("allot") or low in ("occupied", "leased"):
+        return "ALLOTTED"
+    if low in ("unallotted", "vacant", "available", "open", "free"):
+        return "AVAILABLE"
+    if low in ("cancelled", "canceled", "cancelled - returned"):
+        return "CANCELLED"
+    if low in ("disputed", "dispute"):
+        return "DISPUTED"
+    if low in ("under_review", "under review", "review"):
+        return "UNDER REVIEW"
+    # Fallback: uppercase whatever came in
+    return raw.upper()
+
+
+class UpdateReferencePlotRequest(BaseModel):
+    """Request body for updating a CSIDC reference plot's properties."""
+
+    allottee: str | None = None
+    status: str | None = None
+    allotment_date: str | None = None  # ISO format date string
+
+
+@router.put("/reference-plots/{plot_id}")
+async def update_reference_plot(
+    plot_id: int,
+    body: UpdateReferencePlotRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update editable properties of a CSIDC reference plot.
+
+    Persists changes to the cached properties_json so they survive
+    across sessions.
+    """
+    result = await db.execute(
+        select(CsidcReferencePlot).where(CsidcReferencePlot.id == plot_id)
+    )
+    plot = result.scalar_one_or_none()
+    if not plot:
+        raise HTTPException(status_code=404, detail="Reference plot not found")
+
+    # Parse existing properties
+    props = json.loads(plot.properties_json) if plot.properties_json else {}
+
+    # Update only the fields that were provided
+    if body.allottee is not None:
+        props["allottee"] = body.allottee
+    if body.status is not None:
+        props["status"] = body.status
+        props["status_inf"] = body.status
+    if body.allotment_date is not None:
+        props["allotment_date"] = body.allotment_date
+
+    plot.properties_json = json.dumps(props)
+    await db.flush()
+
+    logger.info(f"Updated reference plot {plot_id} properties")
+
+    # Return the updated properties in the same format as the GeoJSON endpoint
+    plot_name = (
+        plot.plot_name
+        or props.get("plotno_inf")
+        or props.get("PLOT_NO")
+        or props.get("plot_no")
+        or props.get("plot_name")
+        or props.get("kh_no")
+        or f"Plot-{plot.id}"
+    )
+    allottee = (
+        props.get("allottee")
+        or props.get("ALLOTTEE")
+        or props.get("allottee_name")
+        or props.get("allottee_n")
+        or props.get("firm_name")
+        or props.get("FIRM_NAME")
+        or props.get("allotmentr")
+        or ""
+    )
+    status = (
+        props.get("status_inf")
+        or props.get("status_from_csidc")
+        or props.get("status")
+        or props.get("STATUS")
+        or props.get("allot_status")
+        or props.get("category_i")
+        or ""
+    )
+
+    return {
+        "ref_id": plot.id,
+        "name": str(plot_name),
+        "allottee": str(allottee),
+        "status": _normalize_status(str(status)),
+        "allotment_date": props.get("allotment_date"),
+        "area_name": plot.area_name,
     }
 
 
