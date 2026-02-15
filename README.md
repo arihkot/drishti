@@ -75,49 +75,6 @@ Drishti is an AI-powered geospatial compliance platform built for the **Chhattis
 
 ---
 
-## Architecture Overview
-
-```
-                                ┌───────────────────────┐
-                                │     React Frontend    │
-                                │  (OpenLayers + Zustand)│
-                                └──────────┬────────────┘
-                                           │ HTTP / REST
-                                           ▼
-                                ┌───────────────────────┐
-                                │   FastAPI Backend      │
-                                │   (Async + Uvicorn)    │
-                                ├───────────────────────┤
-                                │  Routers               │
-                                │  ├─ auth               │
-                                │  ├─ areas              │
-                                │  ├─ projects           │
-                                │  ├─ detection          │
-                                │  ├─ comparison         │
-                                │  └─ export             │
-                                ├───────────────────────┤
-                                │  Services              │
-                                │  ├─ SAM Detector       │
-                                │  ├─ Tile Fetcher       │
-                                │  ├─ Vectorizer         │
-                                │  ├─ Comparator         │
-                                │  ├─ CSIDC Client       │
-                                │  └─ PDF Generator      │
-                                ├───────────────────────┤
-                                │  SQLite (aiosqlite)    │
-                                └──────────┬────────────┘
-                                           │
-                        ┌──────────────────┼──────────────────┐
-                        ▼                  ▼                  ▼
-               ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-               │ ESRI Satellite│  │ CSIDC GeoServer│  │  SAM Model  │
-               │   Tile Server │  │  (WFS / WMS)  │  │ (segment-   │
-               │              │  │              │  │  geospatial) │
-               └──────────────┘  └──────────────┘  └──────────────┘
-```
-
----
-
 ## Tech Stack
 
 ### Backend
