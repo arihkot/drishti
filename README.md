@@ -25,7 +25,6 @@ Drishti is an AI-powered geospatial compliance platform built for the **Chhattis
 
 
 - [Key Features](#key-features)
-- [Architecture Overview](#architecture-overview)
 - [Tech Stack](#tech-stack)
 - [Project Structure](#project-structure)
 - [Prerequisites](#prerequisites)
