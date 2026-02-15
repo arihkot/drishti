@@ -6,7 +6,23 @@ Drishti is an AI-powered geospatial compliance platform built for the **Chhattis
 
 ---
 
+## Demo
+
+<img width="1466" height="852" alt="Screenshot 2026-02-14 at 11 48 42 AM" src="https://github.com/user-attachments/assets/d69cf919-bcd1-4026-a0d4-cc1b93532ff1" />
+<img width="1469" height="851" alt="Screenshot 2026-02-14 at 11 33 16 AM" src="https://github.com/user-attachments/assets/13f2bf11-a324-40fa-9a65-a915595e956d" />
+<img width="1448" height="834" alt="Screenshot 2026-02-14 at 7 15 45 PM" src="https://github.com/user-attachments/assets/64c3bd0e-7e8e-40f0-b600-91868805c59e" />
+<img width="1070" height="853" alt="Screenshot 2026-02-14 at 11 35 13 AM" src="https://github.com/user-attachments/assets/9e6f11fb-1f89-4436-b486-7cc2e19c5b98" />
+<img width="1466" height="851" alt="Screenshot 2026-02-14 at 11 34 14 AM" src="https://github.com/user-attachments/assets/7eca9732-3c05-4c78-9dfa-50ac1cc0cce0" />
+<img width="1463" height="885" alt="Screenshot 2026-02-14 at 11 32 15 AM" src="https://github.com/user-attachments/assets/0bef585f-6c2c-47a1-aa9e-957e278a7b8e" />
+<img width="1080" height="833" alt="Screenshot 2026-02-14 at 11 35 44 AM" src="https://github.com/user-attachments/assets/d79aedf3-b767-41a4-8d06-a6b3d91c4227" />
+<img width="1450" height="830" alt="Screenshot 2026-02-14 at 7 00 39 PM" src="https://github.com/user-attachments/assets/c8d89180-4987-4473-b24a-edb75f0ee75e" />
+<img width="1413" height="495" alt="Screenshot 2026-02-14 at 7 04 35 PM" src="https://github.com/user-attachments/assets/0bdc61fe-1162-4ecf-a2e7-aba9df2e9ff6" />
+
+
+---
 ## Table of Contents
+
+
 
 - [Key Features](#key-features)
 - [Architecture Overview](#architecture-overview)
